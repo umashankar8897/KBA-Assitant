@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>First-line support assistant — demo</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/2.44.0/iconfont/tabler-icons.min.css" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div id="busy-bar"></div>
+
+<header class="topbar">
+  <span class="brand">First-line support assistant</span>
+  <nav class="nav" id="app-nav" hidden>
+    <span class="tag" id="signed-in-as"></span>
+    <button class="btn btn-ghost btn-small" id="nav-call">New call</button>
+    <button class="btn btn-ghost btn-small" id="nav-manage">Manage KBAs</button>
+    <button class="btn btn-ghost btn-small" id="nav-team" hidden>Team</button>
+    <button class="btn btn-ghost btn-small" id="sign-out">Sign out</button>
+  </nav>
+</header>
+
+<div class="app-shell" id="app-message" hidden></div>
+
+<div class="app-shell" id="app-loading">
+  <div class="loading-state"><span class="spinner"></span> Loading your KBA library&hellip;</div>
+</div>
+
+<section class="app-shell" id="screen-auth" hidden>
+  <h1 id="auth-heading">Sign in</h1>
+  <p class="lede" id="auth-lede">Sign in to reach your team's KBA library.</p>
+
+  <div id="auth-error" class="errors" hidden></div>
+  <div id="auth-notice" class="notice" hidden></div>
+
+  <form id="auth-form">
+    <label class="field-label" for="auth-email">Email</label>
+    <input type="email" id="auth-email" autocomplete="email" placeholder="you@example.com" />
+
+    <label class="field-label" for="auth-password">Password</label>
+    <input type="password" id="auth-password" autocomplete="current-password" placeholder="At least 6 characters" />
+
+    <div id="signup-fields" hidden>
+      <label class="field-label" for="auth-join-code">
+        Join code <span class="hint">optional &mdash; if an admin gave you one</span>
+      </label>
+      <input type="text" id="auth-join-code" autocomplete="off" placeholder="e.g. 7QK2M4XP" />
+
+      <div id="org-name-field">
+        <label class="field-label" for="auth-org-name">
+          Organisation name <span class="hint">you will be its admin, starting from the standard KBAs</span>
+        </label>
+        <input type="text" id="auth-org-name" placeholder="e.g. Northern Region Support" />
+      </div>
+    </div>
+
+    <button class="btn btn-primary" id="auth-submit" type="submit">Sign in</button>
+  </form>
+
+  <p class="muted small">
+    <span id="auth-switch-text">No account yet?</span>
+    <button class="btn-link" id="auth-switch" type="button">Create one</button>
+  </p>
+</section>
+
+<main class="app-shell" id="app-shell" hidden>
+
+  <section id="screen-intake" class="screen active">
+    <h1>What's the issue?</h1>
+    <p class="lede">Describe the call in your own words. The assistant matches it against the KBA library.</p>
+    <textarea id="issue-text" rows="3" placeholder="e.g. My till is not powering on, screen is completely blank"></textarea>
+    <button class="btn btn-primary" id="find-kba">Find matching KBA</button>
+    <div id="match-results" class="match-results"></div>
+
+    <h2 class="section-head">Or search the library</h2>
+    <input type="search" id="kba-search" autocomplete="off"
+           placeholder="Search by reference, title or keyword" />
+    <div id="search-results" class="match-results"></div>
+  </section>
+
+  <section id="screen-flow" class="screen">
+    <p class="eyebrow" id="flow-title"></p>
+    <div id="flow-log" class="flow-log"></div>
+    <div id="flow-step" class="flow-step"></div>
+  </section>
+
+  <section id="screen-review" class="screen">
+    <div class="review-head">
+      <h1>Review before you close</h1>
+      <span id="review-badge" class="badge"></span>
+    </div>
+    <div id="review-fields" class="review-fields"></div>
+    <label class="field-label">Generated description</label>
+    <textarea id="review-description" class="description-box" rows="14"></textarea>
+    <div class="review-actions">
+      <button class="btn btn-quiet" id="start-over">Start new call</button>
+      <button class="btn btn-primary" id="copy-description">Copy description</button>
+    </div>
+  </section>
+
+  <section id="screen-manage" class="screen">
+    <div class="review-head">
+      <h1>KBA library</h1>
+      <span id="kba-count" class="muted"></span>
+    </div>
+    <div id="manage-message" hidden></div>
+
+    <p class="notice" id="manage-readonly" hidden>
+      These are the KBAs your organisation works to. Only an admin can change them.
+    </p>
+    <button class="btn btn-primary" id="new-kba">Add a KBA</button>
+
+    <div class="filter-row">
+      <input type="search" id="kba-filter" autocomplete="off"
+             placeholder="Filter by reference, title or keyword" />
+      <button class="btn btn-ghost" id="clear-filter" hidden>Clear</button>
+    </div>
+
+    <div id="kba-list"></div>
+    <button class="btn btn-quiet" id="reset-kbas">Reset to the original KBAs</button>
+  </section>
+
+  <section id="screen-team" class="screen">
+    <div class="review-head">
+      <h1>Team</h1>
+      <span class="badge badge-success" id="team-role"></span>
+    </div>
+    <div id="team-body"></div>
+  </section>
+
+  <section id="screen-editor" class="screen">
+    <div class="editor-layout">
+      <div class="editor-main">
+        <h1 id="editor-heading">Add a KBA</h1>
+        <p class="lede">For straightforward KBAs: a list of steps to work through, then
+        one question that decides whether the issue is resolved or needs escalating.</p>
+
+        <div id="editor-errors" class="errors" hidden></div>
+
+        <h2 class="section-head flush">Source PDF <span class="hint">optional</span></h2>
+        <p class="muted small tight">Pulls the text out so you can copy details across.
+        Nothing is filled in for you &mdash; the fields below are still yours to write.</p>
+        <input type="file" id="pdf-file" accept="application/pdf,.pdf" />
+        <p id="pdf-status" hidden></p>
+
+        <label class="field-label" for="kba-title">Title</label>
+        <input type="text" id="kba-title" placeholder="e.g. Till not powering on" />
+
+        <label class="field-label" for="kba-reference">
+          Reference <span class="hint" id="reference-hint">filled in from the title until you change it</span>
+        </label>
+        <input type="text" id="kba-reference" autocomplete="off" placeholder="kba-till-power" />
+
+        <label class="field-label" for="kba-keywords">
+          Keywords <span class="hint">comma separated — what the assistant searches when matching a call</span>
+        </label>
+        <input type="text" id="kba-keywords" placeholder="till, power, blank screen, won't turn on" />
+
+        <label class="field-label" for="kba-example">
+          Example issue <span class="hint">optional — how an analyst might describe the call</span>
+        </label>
+        <textarea id="kba-example" rows="2" placeholder="e.g. My till is not powering on and the screen is completely blank."></textarea>
+
+        <h2 class="section-head">Steps to work through</h2>
+        <div id="action-steps"></div>
+        <button class="btn btn-ghost btn-small" id="add-action">Add a step</button>
+
+        <h2 class="section-head">Final question</h2>
+        <p class="muted small tight">Answering yes resolves the call. Answering no escalates it.</p>
+        <label class="field-label" for="question-text">Question to ask</label>
+        <input type="text" id="question-text" placeholder="e.g. Did the till power on?" />
+
+        <h2 class="section-head">If the answer is yes</h2>
+        <label class="field-label" for="resolve-note">
+          Note for the description <span class="hint">optional</span>
+        </label>
+        <textarea id="resolve-note" rows="2" placeholder="e.g. Advised the user on the password requirements."></textarea>
+        <label class="field-label" for="resolve-fields">
+          Details to capture <span class="hint">optional — one per line</span>
+        </label>
+        <textarea id="resolve-fields" rows="3" placeholder="Till number&#10;Total number of tills"></textarea>
+
+        <h2 class="section-head">If the answer is no</h2>
+        <label class="field-label" for="escalate-team">
+          Team to escalate to <span class="hint">optional</span>
+        </label>
+        <input type="text" id="escalate-team" placeholder="e.g. hardware team" />
+        <label class="field-label" for="escalate-note">
+          Note for the description <span class="hint">optional</span>
+        </label>
+        <textarea id="escalate-note" rows="2"></textarea>
+        <label class="field-label" for="escalate-fields">
+          Details to capture <span class="hint">optional — one per line</span>
+        </label>
+        <textarea id="escalate-fields" rows="4" placeholder="Till number&#10;Total number of tills&#10;Base unit light status"></textarea>
+
+        <div class="review-actions">
+          <button class="btn btn-quiet" id="cancel-edit">Cancel</button>
+          <button class="btn btn-primary" id="save-kba">Save KBA</button>
+        </div>
+      </div>
+
+      <aside class="source-panel" id="source-panel" hidden>
+        <div class="panel-head">
+          <h2 class="section-head flush">Source document</h2>
+          <button class="btn btn-quiet btn-small" id="hide-source" type="button">Hide</button>
+        </div>
+        <p class="muted small" id="source-summary"></p>
+        <textarea id="source-text" class="source-box" rows="28"
+                  placeholder="Extracted text appears here"></textarea>
+      </aside>
+    </div>
+  </section>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="config.js"></script>
+<script src="kba-data.js"></script>
+<script src="storage.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
