@@ -22,11 +22,38 @@
 // rowToKBA and kbaToRow below are the only two places that know about any of
 // that. Everything else in the file — and all of app.js — works in the app shape.
 
-// Left null when config.js has not been filled in yet, so the app can say so
-// rather than dying on load with an unexplained error.
-const supabaseClient = SUPABASE_URL && SUPABASE_ANON_KEY
-  ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-  : null;
+// Three ways the client can fail to exist before a single request is made: the
+// library never arrived, config.js was never filled in, or the values in it are
+// not something createClient will accept. Each needs a different thing from
+// whoever is looking at the screen, so the reason is recorded rather than being
+// flattened into a null.
+//
+// Left null in all three cases, so the app can say what happened instead of
+// dying on load with an unexplained error.
+let supabaseClientProblem = null;
+
+function createSupabaseClient() {
+  if (typeof supabase === "undefined") {
+    supabaseClientProblem = "library-missing";
+    return null;
+  }
+
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    supabaseClientProblem = "config-missing";
+    return null;
+  }
+
+  try {
+    return supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  } catch (error) {
+    // A malformed project URL throws here rather than at the first request.
+    console.error("Supabase rejected the values in config.js.", error);
+    supabaseClientProblem = "config-invalid";
+    return null;
+  }
+}
+
+const supabaseClient = createSupabaseClient();
 
 function rowToKBA(row) {
   return {

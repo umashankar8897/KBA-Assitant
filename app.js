@@ -24,6 +24,25 @@ function showMessage(slotId, text, kind) {
   el.hidden = false;
 }
 
+function showRetryableMessage(slotId, text, actionLabel, onRetry) {
+  const el = document.getElementById(slotId);
+  if (!el) return;
+
+  el.className = "message message-problem";
+  el.innerHTML = `<p class="message-text"></p><button class="btn btn-ghost btn-small" data-retry></button>`;
+  el.querySelector(".message-text").textContent = text;
+
+  const button = el.querySelector("[data-retry]");
+  button.textContent = actionLabel;
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    button.textContent = "Trying\u2026";
+    onRetry();
+  });
+
+  el.hidden = false;
+}
+
 function clearMessage(slotId) {
   const el = document.getElementById(slotId);
   if (el) el.hidden = true;
@@ -34,7 +53,7 @@ function clearMessage(slotId) {
 // list is already up to date, on failure it gets false and KBAS is untouched.
 // slotId says where a failure should be reported, so the message lands beside
 // whatever the analyst was doing rather than in a dialog over the whole page.
-async function runStorageAction(action, slotId = "app-message") {
+async function runStorageAction(action, slotId = "app-message", retry = null) {
   document.body.classList.add("is-busy");
 
   try {
@@ -53,7 +72,18 @@ async function runStorageAction(action, slotId = "app-message") {
     return true;
   } catch (error) {
     console.error(error);
-    showMessage(slotId, `Could not reach the KBA database. ${error.message || error}`);
+
+    const configuration = classifyFailure(error) === FAILURE_CONFIGURATION;
+    const text = configuration
+      ? `Supabase refused the request. That usually means the project URL or anon key in config.js ` +
+        `is wrong, or your account no longer has access. ${error.message || error}`
+      : `The KBA library could not be reached. That is usually a connection problem rather than ` +
+        `anything wrong with the app. ${error.message || error}`;
+
+    if (retry) showRetryableMessage(slotId, text, configuration ? "Reload" : "Try again",
+      configuration ? () => window.location.reload() : retry);
+    else showMessage(slotId, text);
+
     return false;
   } finally {
     document.body.classList.remove("is-busy");
@@ -1439,7 +1469,7 @@ async function showSignedIn(session) {
   // Fetch before revealing the app, so there is no moment where the analyst can
   // type an issue into a library that has not arrived yet. loadKBAs seeds from
   // DEFAULT_KBAS only for an admin whose organisation is empty.
-  await runStorageAction(() => loadKBAs(profile));
+  await loadLibrary();
 
   if (profileError) {
     showMessage("app-message",
@@ -1454,6 +1484,19 @@ async function showSignedIn(session) {
 
   renderSearchResults();
   showScreen("screen-intake");
+}
+
+// Fetching the library, with a way to ask again if it does not arrive. Used both
+// on sign-in and by the retry button that appears when it fails.
+async function loadLibrary() {
+  const ok = await runStorageAction(() => loadKBAs(profile), "app-message", loadLibrary);
+  if (!ok) return false;
+
+  // A retry lands on whichever screen the analyst was already looking at.
+  renderSearchResults();
+  if (document.getElementById("screen-manage").classList.contains("active")) renderManageScreen();
+
+  return true;
 }
 
 // Called for the session found at startup and for every change after it.
@@ -1543,21 +1586,156 @@ document.getElementById("sign-out").addEventListener("click", async () => {
   document.getElementById("match-results").innerHTML = "";
 });
 
+// ---------------------------------------------------------------------------
+// Starting up, and failing to
+// ---------------------------------------------------------------------------
+//
+// A blank screen with an error in the console tells an analyst nothing. Anything
+// that stops the app starting is caught here and shown on the page instead.
+//
+// The two kinds of failure need different things from whoever is reading:
+//
+//   network        the app is fine, something between here and Supabase is not.
+//                  Worth trying again, possibly in a minute.
+//   configuration  the app will never start with these values. Trying again
+//                  changes nothing; config.js has to be corrected first.
+//
+// Anything unrecognised is treated as a network problem, because offering a
+// retry that does nothing is a smaller error than withholding one that would
+// have worked.
+
+const FAILURE_NETWORK = "network";
+const FAILURE_CONFIGURATION = "configuration";
+
+function classifyFailure(error) {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return FAILURE_NETWORK;
+
+  const text = String((error && (error.message || error.msg)) || error || "").toLowerCase();
+
+  if (/invalid api key|invalid.*url|jwt|apikey|api key|unauthorized|401|403|forbidden|no api key/.test(text)) {
+    return FAILURE_CONFIGURATION;
+  }
+
+  if (/failed to fetch|networkerror|network request failed|load failed|err_|timeout|timed out|offline|dns/.test(text)) {
+    return FAILURE_NETWORK;
+  }
+
+  return FAILURE_NETWORK;
+}
+
+// Copy for each way the app can refuse to start. Kept together so the wording
+// stays consistent across them.
+function describeStartupFailure(reason, error) {
+  if (reason === "library-missing") {
+    return {
+      kind: FAILURE_NETWORK,
+      title: "The app could not finish loading",
+      detail: "A part of the app is served from a CDN and it did not arrive. That is usually a " +
+              "connection problem or a blocker in the browser. Check you are online and try again.",
+      action: "Try again"
+    };
+  }
+
+  if (reason === "config-missing") {
+    return {
+      kind: FAILURE_CONFIGURATION,
+      title: "Not connected yet",
+      detail: "This copy of the app has no Supabase project to talk to. Add your project URL and " +
+              "anon key to config.js, then reload. The schema those keys expect is in " +
+              "supabase-setup.sql.",
+      action: "Reload"
+    };
+  }
+
+  if (reason === "config-invalid") {
+    return {
+      kind: FAILURE_CONFIGURATION,
+      title: "The project settings are not valid",
+      detail: "Supabase rejected the project URL or anon key in config.js. Check them against " +
+              "Project Settings then API in your Supabase dashboard, then reload. Trying again " +
+              "will not help until they are corrected.",
+      action: "Reload"
+    };
+  }
+
+  if (classifyFailure(error) === FAILURE_CONFIGURATION) {
+    return {
+      kind: FAILURE_CONFIGURATION,
+      title: "The KBA library refused the connection",
+      detail: "Supabase answered, but rejected this app's project URL or anon key. Check them " +
+              "against Project Settings then API in your Supabase dashboard, then reload. " +
+              "Trying again will not help until they are corrected.",
+      action: "Reload"
+    };
+  }
+
+  return {
+    kind: FAILURE_NETWORK,
+    title: "The KBA library could not be reached",
+    detail: "The app could not get through to Supabase. That is usually a connection problem " +
+            "rather than anything wrong with the app itself. Check you are online and try again.",
+    action: "Try again"
+  };
+}
+
+function showStartupFailure(reason, error) {
+  const failure = describeStartupFailure(reason, error);
+
+  document.getElementById("app-loading").hidden = true;
+  document.getElementById("screen-auth").hidden = true;
+  document.getElementById("app-shell").hidden = true;
+  document.getElementById("app-nav").hidden = true;
+
+  document.getElementById("app-failed-title").textContent = failure.title;
+  document.getElementById("app-failed-detail").textContent = failure.detail;
+
+  const reasonEl = document.getElementById("app-failed-reason");
+  const technical = error && (error.message || String(error));
+  reasonEl.textContent = technical || "";
+  reasonEl.hidden = !technical;
+
+  const retry = document.getElementById("app-retry");
+  retry.textContent = failure.action;
+  retry.disabled = false;
+
+  // A configuration problem cannot be retried away, so that button reloads the
+  // page instead — which is what the user has to do after editing config.js.
+  retry.onclick = failure.kind === FAILURE_CONFIGURATION
+    ? () => window.location.reload()
+    : () => boot();
+
+  document.getElementById("app-failed").hidden = false;
+}
+
+// Only ever one auth listener, however many times boot runs.
+let authSubscribed = false;
+
 async function boot() {
+  document.getElementById("app-failed").hidden = true;
+  document.getElementById("app-loading").hidden = false;
+
   if (!supabaseClient) {
-    document.getElementById("app-loading").innerHTML =
-      `<div class="empty-state">
-         <h2>Not connected yet</h2>
-         <p>Add your project URL and anon key to <code>config.js</code>, then reload.
-         The schema those keys expect is in <code>supabase-setup.sql</code>.</p>
-       </div>`;
+    showStartupFailure(supabaseClientProblem || "config-missing", null);
     return;
   }
 
-  const { data: { session } } = await supabaseClient.auth.getSession();
-  await applySession(session);
+  try {
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    await applySession(session);
 
-  supabaseClient.auth.onAuthStateChange((event, session) => applySession(session));
+    if (!authSubscribed) {
+      authSubscribed = true;
+      supabaseClient.auth.onAuthStateChange((event, session) => {
+        applySession(session).catch(error => {
+          console.error(error);
+          showStartupFailure(null, error);
+        });
+      });
+    }
+  } catch (error) {
+    console.error(error);
+    showStartupFailure(null, error);
+  }
 }
 
 boot();
