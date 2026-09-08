@@ -684,7 +684,7 @@ let editorModel = null;
 // imagePath is what the flow JSON stores. imageFile and imagePreview only exist
 // between picking a file and saving, when the upload actually happens.
 function blankAction() {
-  return { text: "", label: "", imagePath: "", imageFile: null, imagePreview: "" };
+  return { text: "", label: "", imagePath: "", imageFile: null, imagePreview: "", uncertainNote: "" };
 }
 
 function blankFormModel() {
@@ -701,7 +701,10 @@ function blankFormModel() {
     // back changes nothing.
     question: { text: "", label: "", yesLabel: "Yes", noLabel: "No", outcomeCheck: true },
     resolve: { note: "", captureFields: [] },
-    escalate: { team: "", note: "", captureFields: [] }
+    escalate: { team: "", note: "", captureFields: [] },
+    // Anything a drafted KBA was not read confidently. Empty for one typed by
+    // hand or loaded from the database.
+    uncertain: []
   };
 }
 
@@ -722,7 +725,8 @@ function toFormModel(kba) {
       label: step.label || "",
       imagePath: step.image || "",
       imageFile: null,
-      imagePreview: ""
+      imagePreview: "",
+      uncertainNote: ""
     });
     stepId = step.next;
   }
@@ -765,7 +769,8 @@ function toFormModel(kba) {
       team: escalate.team || "",
       note: escalate.note || "",
       captureFields: (escalate.captureFields || []).slice()
-    }
+    },
+    uncertain: []
   };
 }
 
@@ -839,6 +844,8 @@ let referenceEdited = false;
 let originalImagePaths = [];
 
 function openEditor(id) {
+  pendingPdf = null;
+
   if (id) {
     const existing = KBAS.find(kba => kba.id === id);
     originalImagePaths = imagePathsIn([existing]);
@@ -880,8 +887,9 @@ function renderEditor() {
   document.getElementById("escalate-note").value = model.escalate.note;
   document.getElementById("escalate-fields").value = model.escalate.captureFields.join("\n");
 
-  document.getElementById("pdf-file").value = "";
+  if (!pendingPdf) document.getElementById("pdf-file").value = "";
   document.getElementById("pdf-status").hidden = true;
+  document.getElementById("draft-uncertain").hidden = true;
   document.getElementById("source-text").value = model.sourceText;
 
   if (model.sourceText) {
@@ -893,6 +901,8 @@ function renderEditor() {
   }
 
   renderActionSteps();
+  renderPdfActions();
+  placeUncertainNotes();
 }
 
 function renderActionSteps() {
@@ -913,6 +923,8 @@ function renderActionSteps() {
       <textarea rows="2" data-action-text placeholder="e.g. Check and note the light status on the base unit of the till.">${escapeHtml(action.text)}</textarea>
       <label class="field-label">Short label for the ticket <span class="hint">optional — the step text is used if this is blank</span></label>
       <input type="text" data-action-label value="${escapeHtml(action.label)}" placeholder="e.g. Checked base unit light status" />
+
+      ${action.uncertainNote ? uncertainNoteMarkup(action.uncertainNote) : ""}
 
       <label class="field-label">Screenshot <span class="hint">optional — an image up to 2 MB</span></label>
       ${stepImagePreview(action, index)}
@@ -1037,7 +1049,10 @@ function readEditorInputs() {
       label: row.querySelector("[data-action-label]").value.trim(),
       imagePath: existing.imagePath,
       imageFile: existing.imageFile,
-      imagePreview: existing.imagePreview
+      imagePreview: existing.imagePreview,
+      // Travels with its step, so reordering or removing one keeps the flags
+      // pointing at the right thing.
+      uncertainNote: existing.uncertainNote || ""
     };
   });
 }
@@ -1237,15 +1252,233 @@ function closeSourcePanel() {
 
 const plural = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
 
+// ---------------------------------------------------------------------------
+// Drafting a KBA from a document
+// ---------------------------------------------------------------------------
+//
+// The PDF goes to the parse-kba Edge Function, which holds the Gemini key and
+// checks the caller is an admin before reading anything. What comes back is a
+// draft: it fills the form in and nothing else. Nothing is saved until the admin
+// has read it and pressed Save, and anything the model was unsure of is flagged
+// against the field it affects.
+
+// The file waiting to be drafted from, if any.
+let pendingPdf = null;
+
+// Which form field each uncertain flag belongs beside. Anything outside this
+// list is shown above the form rather than dropped — a flag nobody sees is
+// worse than one in a slightly odd place.
+const UNCERTAIN_ANCHORS = {
+  reference: "kba-reference",
+  title: "kba-title",
+  keywords: "kba-keywords",
+  issue_example: "kba-example",
+  final_question: "question-text",
+  resolve_note: "resolve-note",
+  resolve_capture_fields: "resolve-fields",
+  escalate_team: "escalate-team",
+  escalate_note: "escalate-note",
+  escalate_capture_fields: "escalate-fields"
+};
+
+function uncertainNoteMarkup(note) {
+  return `<p class="uncertain-note"><span class="uncertain-tag">Check</span><span>${escapeHtml(note)}</span></p>`;
+}
+
+function renderPdfActions() {
+  document.getElementById("draft-from-pdf").hidden = pendingPdf === null;
+}
+
+// Flags for fields, placed after the input each one is about. Step flags are not
+// handled here: those live on the step and are drawn with it.
+function placeUncertainNotes() {
+  document.querySelectorAll("#screen-editor .editor-main .uncertain-note").forEach(el => {
+    if (!el.closest(".step-row")) el.remove();
+  });
+
+  const orphans = [];
+  const items = (editorModel && editorModel.uncertain) || [];
+
+  items.forEach(item => {
+    const anchorId = UNCERTAIN_ANCHORS[item.field];
+    const anchor = anchorId && document.getElementById(anchorId);
+
+    if (!anchor) {
+      orphans.push(item);
+      return;
+    }
+
+    anchor.insertAdjacentHTML("afterend", uncertainNoteMarkup(item.note));
+  });
+
+  const panel = document.getElementById("draft-uncertain");
+  if (!orphans.length) {
+    panel.hidden = true;
+    return;
+  }
+
+  panel.className = "message message-plain";
+  panel.innerHTML = `<strong>Worth a second look</strong><ul>${
+    orphans.map(item => `<li>${escapeHtml(item.note)}</li>`).join("")}</ul>`;
+  panel.hidden = false;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    // readAsDataURL gives "data:application/pdf;base64,AAAA..."; the function
+    // wants only what follows the comma.
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = () => reject(reader.error || new Error("The file could not be read."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formHasContent() {
+  const model = editorModel;
+  return Boolean(
+    model.title || model.reference || model.keywords.length || model.issueExample ||
+    model.question.text || model.resolve.note || model.escalate.team ||
+    model.actions.some(action => action.text || action.label)
+  );
+}
+
+// Fills the form in from a draft. Deliberately the only thing that happens with
+// one: no save, no upload, no change to the library.
+function applyDraft(draft, uncertain) {
+  const stepNotes = new Map();
+  const fieldNotes = [];
+
+  (uncertain || []).forEach(item => {
+    const step = /^step_([1-9][0-9]*)$/.exec(item.field || "");
+    if (step) stepNotes.set(Number(step[1]) - 1, item.note);
+    else fieldNotes.push(item);
+  });
+
+  editorModel.reference = draft.reference || "";
+  editorModel.title = draft.title || "";
+  editorModel.keywords = (draft.keywords || []).slice();
+  editorModel.issueExample = draft.issue_example || "";
+  editorModel.question.text = draft.final_question || "";
+  editorModel.resolve.note = (draft.resolve && draft.resolve.note) || "";
+  editorModel.resolve.captureFields = ((draft.resolve && draft.resolve.capture_fields) || []).slice();
+  editorModel.escalate.team = (draft.escalate && draft.escalate.team) || "";
+  editorModel.escalate.note = (draft.escalate && draft.escalate.note) || "";
+  editorModel.escalate.captureFields = ((draft.escalate && draft.escalate.capture_fields) || []).slice();
+  editorModel.uncertain = fieldNotes;
+
+  editorModel.actions = (draft.action_steps || []).map((step, index) => ({
+    ...blankAction(),
+    text: step.text || "",
+    label: step.label || "",
+    uncertainNote: stepNotes.get(index) || ""
+  }));
+
+  if (!editorModel.actions.length) editorModel.actions = [blankAction()];
+
+  // The drafted reference is the admin's to keep or change; the title should not
+  // quietly overwrite it as they edit.
+  referenceEdited = true;
+
+  renderEditor();
+}
+
+document.getElementById("draft-from-pdf").addEventListener("click", async () => {
+  if (!pendingPdf) return;
+
+  readEditorInputs();
+
+  if (formHasContent() &&
+      !confirm("Replace what is in the form with a draft read from this PDF?\n\n" +
+               "Nothing is saved either way — you will still review it before saving.")) {
+    return;
+  }
+
+  const button = document.getElementById("draft-from-pdf");
+  button.disabled = true;
+  button.textContent = "Reading the document\u2026";
+  showPdfStatus(`Sending ${pendingPdf.name} to be read. This usually takes a few seconds.`, false);
+
+  try {
+    const pdf = await fileToBase64(pendingPdf);
+    const { data, error } = await supabaseClient.functions.invoke("parse-kba", { body: { pdf } });
+
+    if (error) {
+      showPdfStatus(await describeDraftFailure(error), true);
+      return;
+    }
+
+    if (!data || !data.draft) {
+      showPdfStatus("The document was read but no draft came back. Fill the form in by hand.", true);
+      return;
+    }
+
+    applyDraft(data.draft, data.uncertain);
+
+    const flagged = (data.uncertain || []).length;
+    showPdfStatus(
+      `Draft filled in from ${pendingPdf.name}. Nothing has been saved` +
+      (flagged
+        ? `, and ${flagged} thing${flagged === 1 ? "" : "s"} the reader was unsure of ${flagged === 1 ? "is" : "are"} flagged below.`
+        : ". Read it through, then save."),
+      false);
+  } catch (error) {
+    console.error(error);
+    showPdfStatus(`The document could not be sent. ${error.message || error}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Draft this KBA from the PDF";
+    renderPdfActions();
+  }
+});
+
+// The function returns a message written for whoever is reading it, so use that
+// where there is one rather than inventing a worse one here.
+async function describeDraftFailure(error) {
+  const response = error && error.context;
+  const status = response && response.status;
+
+  let body = null;
+  if (response && typeof response.json === "function") {
+    body = await response.json().catch(() => null);
+  }
+
+  if (body && body.error) {
+    if (status === 429) {
+      const wait = body.detail && body.detail.retryAfterSeconds;
+      return body.error + (wait ? ` Try again in about ${wait} seconds.` : "");
+    }
+    return body.error;
+  }
+
+  if (status === 429) {
+    return "The drafting service is busy — it takes about ten to fifteen documents a minute. " +
+           "Wait a moment and try again.";
+  }
+
+  if (status === 404) {
+    return "The drafting service is not deployed for this project. An admin needs to run " +
+           "`supabase functions deploy parse-kba`.";
+  }
+
+  return `The document could not be drafted. ${(error && error.message) || error}`;
+}
+
 document.getElementById("pdf-file").addEventListener("change", async event => {
   const input = event.target;
   const file = input.files[0];
   if (!file) return;
 
+  // Held for the drafting service, which reads the pages itself. Set before the
+  // local text extraction runs, so a PDF that pdf.js cannot read can still be
+  // drafted from.
+  pendingPdf = file;
+  renderPdfActions();
+
   if (!pdfReady()) {
     showPdfStatus(
-      "The PDF reader did not load, so the file cannot be read here. Check your connection " +
-      "and reload the page, or fill the form in by hand.", true);
+      "The PDF reader did not load, so the text cannot be pulled out here. You can still draft " +
+      "from it, or fill the form in by hand.", true);
     return;
   }
 
@@ -1260,9 +1493,9 @@ document.getElementById("pdf-file").addEventListener("change", async event => {
     if (characters < MIN_CHARACTERS_PER_PAGE * pageCount) {
       showPdfStatus(
         `${file.name} has ${plural(pageCount, "page")} but only ${plural(characters, "character")} ` +
-        `of text in it. That almost always means it is a scan \u2014 a picture of a document rather ` +
-        `than a document. Pulling text out of a picture needs OCR, which this app does not do. ` +
-        `Export a PDF from the original file if you can, or type the steps in by hand.`, true);
+        `of text in it, so it is almost certainly a scan \u2014 a picture of a document rather than ` +
+        `a document. There is nothing to copy from, but the drafting service reads scanned pages, ` +
+        `so "Draft this KBA from the PDF" will still work on it.`, true);
       return;
     }
 

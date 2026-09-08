@@ -152,7 +152,15 @@
         <p class="muted small tight">Pulls the text out so you can copy details across.
         Nothing is filled in for you &mdash; the fields below are still yours to write.</p>
         <input type="file" id="pdf-file" accept="application/pdf,.pdf" />
+
+        <div class="pdf-actions">
+          <button class="btn btn-ghost" id="draft-from-pdf" type="button" hidden>
+            Draft this KBA from the PDF
+          </button>
+        </div>
+
         <p id="pdf-status" hidden></p>
+        <div id="draft-uncertain" hidden></div>
 
         <label class="field-label" for="kba-title">Title</label>
         <input type="text" id="kba-title" placeholder="e.g. Till not powering on" />

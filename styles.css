@@ -832,3 +832,37 @@ body.is-busy #busy-bar::after {
   .flow-step { padding: var(--space-4) var(--space-3); }
   .step-row-head { gap: var(--space-2); }
 }
+
+/* --- Drafting from a document -------------------------------------------- */
+
+.pdf-actions { margin-bottom: var(--space-4); }
+.pdf-actions .btn { margin-top: 0; }
+
+/* Something the model was not sure of, sitting against the field it affects. */
+.uncertain-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: calc(var(--space-5) * -1 + var(--space-2)) 0 var(--space-5);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--ink-muted);
+}
+
+.step-row .uncertain-note { margin: calc(var(--space-4) * -1 + var(--space-2)) 0 var(--space-4); }
+
+.uncertain-tag {
+  flex: none;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warning-ink);
+  background: var(--warning-bg);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+  margin-top: 1px;
+}
+
+#draft-uncertain { margin: 0 0 var(--space-5); }
+#draft-uncertain ul { margin: var(--space-2) 0 0; padding-left: var(--space-4); }
