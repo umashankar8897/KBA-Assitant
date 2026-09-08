@@ -1,0 +1,21 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+
+# Supabase local files
+supabase/.temp/
+supabase/.branches/
+
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
+# Logs
+*.log
