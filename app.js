@@ -24,6 +24,24 @@ function showMessage(slotId, text, kind) {
   el.hidden = false;
 }
 
+// Not a retry — the action here changes screens entirely rather than trying
+// the same thing again, so this is its own small helper rather than a reuse
+// of showRetryableMessage's disable-and-relabel behaviour.
+function showActionNotice(slotId, text, actionLabel, onAction) {
+  const el = document.getElementById(slotId);
+  if (!el) return;
+
+  el.className = "message message-notice";
+  el.innerHTML = `<p class="message-text"></p><button class="btn btn-primary btn-small" data-action></button>`;
+  el.querySelector(".message-text").textContent = text;
+
+  const button = el.querySelector("[data-action]");
+  button.textContent = actionLabel;
+  button.addEventListener("click", onAction);
+
+  el.hidden = false;
+}
+
 function showRetryableMessage(slotId, text, actionLabel, onRetry) {
   const el = document.getElementById(slotId);
   if (!el) return;
@@ -100,22 +118,83 @@ const state = {
   // The label of the check the issue resolved after, when an analyst ends the
   // call early. Empty on every other path, including a normal resolve at the
   // final question.
-  resolvedAfter: ""
+  resolvedAfter: "",
+  // Why a step could not be carried out, when that is what ended the call.
+  // Empty on every other path. Never set at the same time as resolvedAfter:
+  // a call either got fixed or got stuck, not both.
+  blockedReason: "",
+  // What the analyst noted at each record step, keyed by that step's label.
+  // Held here rather than on the log entries so those stay {label, answer},
+  // and so a capture field of the same name can be filled in from it.
+  recorded: {}
 };
+
+// ---------------------------------------------------------------------------
+// Warning before an in-progress call is lost
+// ---------------------------------------------------------------------------
+//
+// Armed as soon as the analyst has answered the first step of a matched KBA,
+// and stays armed through the review screen until the description has been
+// copied out — that is the point a call is actually done with, not merely the
+// point a ticket badge appears on screen.
+//
+// The browser's own beforeunload confirmation is used rather than a custom
+// modal: a page cannot reliably stop a refresh, tab close or back button with
+// anything it draws itself, and the native prompt is the one thing that can.
+// This only warns — it never persists or recovers the call, so a confirmed
+// refresh still discards everything.
+let callGuardArmed = false;
+
+function armCallGuard() {
+  callGuardArmed = true;
+}
+
+function disarmCallGuard() {
+  callGuardArmed = false;
+}
+
+window.addEventListener("beforeunload", event => {
+  if (!callGuardArmed) return;
+  event.preventDefault();
+  // Chrome has not shown a custom string here in years, but still requires
+  // returnValue to be set before it will show its own confirmation.
+  event.returnValue = "";
+});
+
+// Every place a step gets logged during the flow goes through here, so arming
+// the guard is not something each of those call sites has to remember to do.
+function logStep(entry) {
+  state.log.push(entry);
+  if (!previewMode) armCallGuard();
+}
+
+// The one place a capture field's value changes from something the analyst
+// typed, so a future way of rendering the review fields cannot bypass arming
+// the guard the way a stray state.captured[f] = ... assignment could. Covers
+// the KBA that goes straight from selection to an outcome with no steps
+// logged at all — without this, typing into its capture fields would leave
+// the call unguarded.
+function recordCapturedField(field, value, outcomeStep) {
+  state.captured[field] = value;
+  if (!previewMode) armCallGuard();
+  renderDescription(outcomeStep);
+}
 
 // Used only when a KBA offers no resolve outcome at all from where the analyst
 // is standing. Every KBA the form builds has one, so this is a backstop for
 // hand-authored flows rather than something the app expects to reach.
 const FALLBACK_RESOLVE = { type: "outcome", outcome: "resolve" };
+const FALLBACK_ESCALATE = { type: "outcome", outcome: "escalate" };
 
-// The resolve outcome this call was heading for. Ending early lands on the
-// ending the KBA defines, so the review screen asks for that outcome's capture
-// fields and carries its note, exactly as working through every step would.
+// The outcome of a given kind this call was heading for. Ending a call early
+// lands on the ending the KBA defines, so the review screen asks for that
+// outcome's capture fields and carries its note, exactly as working through
+// every step would.
 //
-// Breadth first, so when a KBA branches to several resolve outcomes the nearest
-// one along the paths still ahead wins rather than whichever happens to be
-// first in the object.
-function findResolveOutcome(kba, fromStepId) {
+// Breadth first, so when a KBA branches to several endings of the same kind the
+// nearest one along the paths still ahead wins rather than whichever happens to
+// be first in the object.
+function findOutcome(kba, fromStepId, outcome) {
   const queue = [fromStepId];
   const seen = new Set();
 
@@ -128,8 +207,8 @@ function findResolveOutcome(kba, fromStepId) {
     if (!step) continue;
 
     if (step.type === "outcome") {
-      if (step.outcome === "resolve") return step;
-      continue;                                   // an escalate or callback ending
+      if (step.outcome === outcome) return step;
+      continue;                                   // an ending of some other kind
     }
 
     if (step.type === "question") (step.options || []).forEach(option => queue.push(option.next));
@@ -139,19 +218,100 @@ function findResolveOutcome(kba, fromStepId) {
   return null;
 }
 
+function findResolveOutcome(kba, fromStepId) {
+  return findOutcome(kba, fromStepId, "resolve");
+}
+
+function findEscalateOutcome(kba, fromStepId) {
+  return findOutcome(kba, fromStepId, "escalate");
+}
+
+// Words that carry nothing about the fault. Stripped from what the analyst types
+// before any word-by-word scoring, so a sentence of scene-setting does not
+// dilute the two or three words that actually name the symptom.
+//
+// Only the typed text is filtered, never the KBA's keywords, and never before
+// the whole-phrase check below — so "turn on" still matches even though "on" is
+// in here.
+const NOISE_WORDS = new Set([
+  // How an analyst frames what they were told.
+  "user", "users", "caller", "customer", "colleague", "store", "mentioned",
+  "said", "says", "saying", "told", "reported", "reports", "reporting",
+  "called", "calling", "rang", "raised", "asked", "asking", "wants", "needs",
+  // Pronouns and articles.
+  "i", "me", "my", "we", "our", "us", "you", "your", "he", "him", "his",
+  "she", "her", "hers", "they", "them", "their", "it", "its",
+  "a", "an", "the", "this", "that", "these", "those", "there", "here",
+  // Verbs and helpers that appear in nearly every sentence.
+  "is", "are", "was", "were", "be", "been", "being", "am",
+  "has", "have", "had", "do", "does", "did", "doing", "done",
+  "will", "would", "can", "could", "should", "shall", "may", "might", "must",
+  "get", "gets", "getting", "got", "go", "goes", "going", "went",
+  "able", "unable", "trying", "tried", "try", "keeps", "keep",
+  // Joining words.
+  "and", "or", "but", "so", "then", "than", "if", "when", "while", "because",
+  "as", "of", "in", "on", "at", "to", "into", "onto", "for", "with", "from",
+  "by", "about", "after", "before", "over", "under", "up", "down", "out",
+  "off", "again", "still", "also", "just", "very", "really", "any", "some",
+  "no", "not", "now", "today", "yesterday", "morning", "please", "thanks",
+  "hi", "hello", "issue", "issues", "problem", "problems", "help"
+]);
+
+// Two points a word for a whole phrase, one for a word found on its own, so a
+// KBA whose exact phrase appears always outscores one that only shares words
+// with the sentence.
+const PHRASE_POINTS = 2;
+const WORD_POINTS = 1;
+
+// One exact single-word keyword is worth showing. Below that a match is a guess,
+// and a guess sends an analyst down the wrong procedure with a caller waiting.
+// Nothing above this bar means the honest "no confident match", which already
+// offers the library to search.
+const MINIMUM_SCORE = 2;
+
+function wordsIn(text) {
+  return String(text).toLowerCase().match(/[a-z0-9']+/g) || [];
+}
+
+// Does this run of words appear in that one, consecutively? Whole words rather
+// than a substring, so the keyword "bo" no longer matches inside "about".
+function containsPhrase(words, phrase) {
+  if (!phrase.length || phrase.length > words.length) return false;
+
+  for (let start = 0; start + phrase.length <= words.length; start += 1) {
+    if (phrase.every((word, offset) => words[start + offset] === word)) return true;
+  }
+  return false;
+}
+
 function scoreKBA(kba, text) {
-  const lower = text.toLowerCase();
+  // Phrases are looked for in what was actually typed; single words in what is
+  // left once the filler is gone.
+  const spoken = wordsIn(text);
+  const meaningful = new Set(spoken.filter(word => !NOISE_WORDS.has(word)));
+
   let score = 0;
-  kba.keywords.forEach(k => {
-    if (lower.includes(k.toLowerCase())) score += k.split(" ").length;
+
+  (kba.keywords || []).forEach(keyword => {
+    const parts = wordsIn(keyword);
+    if (!parts.length) return;
+
+    if (containsPhrase(spoken, parts)) {
+      score += PHRASE_POINTS * parts.length;
+      return;
+    }
+
+    // Partial credit: how much of this keyword turned up anywhere in the text.
+    score += WORD_POINTS * parts.filter(part => meaningful.has(part)).length;
   });
+
   return score;
 }
 
 function findMatches(text) {
   return KBAS
     .map(kba => ({ kba, score: scoreKBA(kba, text) }))
-    .filter(m => m.score > 0)
+    .filter(m => m.score >= MINIMUM_SCORE)
     .sort((a, b) => b.score - a.score);
 }
 
@@ -282,14 +442,336 @@ function renderSearchResults() {
 }
 
 function selectKBA(id) {
-  state.issueText = document.getElementById("issue-text").value;
+  // The intake box has nothing to do with a preview — there was no intake
+  // screen on the way here — so this is the one line of the real selection
+  // path that previewing has to answer differently rather than reuse.
+  state.issueText = previewMode ? "" : document.getElementById("issue-text").value;
   state.selectedKBA = KBAS.find(k => k.id === id);
   state.currentStepId = state.selectedKBA.start;
   state.log = [];
   state.captured = {};
   state.resolvedAfter = "";
+  state.blockedReason = "";
+  state.recorded = {};
   showScreen("screen-flow");
   renderFlowStep();
+}
+
+// ---------------------------------------------------------------------------
+// Previewing a KBA
+// ---------------------------------------------------------------------------
+//
+// Runs the exact same guided flow a real call uses — selectKBA and
+// renderFlowStep below are not touched for this, beyond the one line above
+// that has no intake box to read from here. Three narrow differences are
+// threaded through the few places that need to know about them: nothing here
+// arms the call-in-progress guard, the flag control does not appear (an admin
+// previewing can fix the KBA directly rather than flag it), and the review
+// screen leads back to the library instead of offering a description there
+// is no ticket to copy.
+
+let previewMode = false;
+
+function enterPreview(kba) {
+  previewMode = true;
+  document.getElementById("preview-banner").hidden = false;
+  selectKBA(kba.id);
+}
+
+function exitPreview() {
+  previewMode = false;
+  document.getElementById("preview-banner").hidden = true;
+}
+
+// ---------------------------------------------------------------------------
+// Recovering from a Supabase failure mid-call
+// ---------------------------------------------------------------------------
+//
+// Two things in the call flow reach Supabase on their own, separately from
+// the KBA fetch at the start of the call: flagging a step, and loading a
+// step's screenshot. Either can fail because the analyst's session has
+// expired, because the network dropped, or for some other reason — and those
+// need different responses. An expired session is fixed by signing back in;
+// a dropped connection is fixed by trying again once it is back; neither is
+// helped by discarding the call or leaving the step, so nothing here does
+// that. state.log, state.selectedKBA and state.captured are never touched by
+// any of this — there is still no persistence for an in-progress call.
+
+// Distinguishes what actually went wrong from the shape of the error alone.
+// Separate from classifyFailure, which answers a different question — that
+// one runs before any session exists at all, so a 401 there can only mean a
+// bad anon key. Here a session already exists, so the same kind of error
+// almost always means it has expired rather than that the app is misconfigured.
+function classifySessionError(error) {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return "network";
+
+  const status = error && (error.status || error.statusCode || (error.context && error.context.status));
+  const text = String((error && error.message) || error || "").toLowerCase();
+
+  if (status === 401 || status === 403 ||
+      /jwt|pgrst301|not authenticated|refresh_token|invalid refresh token|session.*expired|expired.*session/.test(text)) {
+    return "auth";
+  }
+
+  if (/failed to fetch|networkerror|network request failed|load failed|err_|timeout|timed out|offline|dns/.test(text)) {
+    return "network";
+  }
+
+  return "other";
+}
+
+// Classifies the error and renders whichever recovery belongs in container:
+// a small sign-in prompt for an expired session, or a message with a plain
+// retry button for a dropped connection or anything else. retry is called
+// with no arguments and is expected to run the whole attempt over again —
+// including this same recovery step, if it fails again the same way.
+function renderSessionRecovery(container, error, retry) {
+  console.error(error);
+  const kind = classifySessionError(error);
+
+  if (kind === "auth") {
+    renderInlineReauth(container, retry);
+    return;
+  }
+
+  const message = kind === "network"
+    ? "Could not reach the server. Check the connection and try again."
+    : `Something went wrong. ${error.message || error}`;
+
+  container.innerHTML = `
+    <p class="errors small tight" data-recovery-message></p>
+    <button type="button" class="btn btn-ghost btn-small" data-recovery-retry>Try again</button>
+  `;
+  container.querySelector("[data-recovery-message]").textContent = message;
+  container.querySelector("[data-recovery-retry]").addEventListener("click", retry, { once: true });
+  container.hidden = false;
+}
+
+// A small sign-in prompt for exactly one situation: the analyst's own session
+// has expired mid-call. Reuses the same field markup and classes as the main
+// sign-in form, but not the form itself — nobody creating an account or
+// joining an organisation belongs here, only signing back into the one
+// already in use, so the smaller, purpose-built handler below is enough.
+let reauthSeq = 0;
+
+function renderInlineReauth(container, onRetry) {
+  const seq = ++reauthSeq;
+
+  container.hidden = false;
+  container.innerHTML = `
+    <p class="errors small tight">Your session has expired. Sign in again to continue.</p>
+    <form data-reauth-form>
+      <label class="field-label" for="reauth-email-${seq}">Email</label>
+      <input type="email" id="reauth-email-${seq}" autocomplete="email" required />
+      <label class="field-label" for="reauth-password-${seq}">Password</label>
+      <input type="password" id="reauth-password-${seq}" autocomplete="current-password" required />
+      <button type="submit" class="btn btn-primary btn-small">Sign in</button>
+      <p class="errors small tight" data-reauth-error hidden></p>
+    </form>
+  `;
+
+  const form = container.querySelector("[data-reauth-form]");
+
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+
+    const email = form.querySelector(`#reauth-email-${seq}`).value.trim();
+    const password = form.querySelector(`#reauth-password-${seq}`).value;
+    const button = form.querySelector("button");
+    const errorEl = form.querySelector("[data-reauth-error]");
+
+    button.disabled = true;
+    button.textContent = "Signing in\u2026";
+    errorEl.hidden = true;
+
+    // Deliberately the plain call, not the main auth form's submit handler —
+    // that one also carries sign-up, join codes and organisation names, none
+    // of which apply to signing back into an account already in use. Signing
+    // in as the same user this quietly resumes into is a no-op for the rest
+    // of the app: applySession already skips re-loading anything when the
+    // signed-in user id has not changed, which is exactly what leaves the
+    // current step undisturbed.
+    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+
+    if (error) {
+      button.disabled = false;
+      button.textContent = "Sign in";
+      errorEl.textContent = error.message;
+      errorEl.hidden = false;
+      return;
+    }
+
+    // Signed back in. Retry the one thing that actually failed, and nothing else.
+    onRetry();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// A step's screenshot
+// ---------------------------------------------------------------------------
+//
+// The library's whole set of screenshots is still signed once, up front,
+// when the KBA is fetched at the start of a call — that has not changed.
+// This is only for when a single step's cached URL turns out not to work by
+// the time the analyst actually reaches it: the session may have expired
+// since, or the link may simply have run past its 8 hours. Either way, the
+// fix is scoped to the one image, never a re-fetch of the whole KBA.
+
+function loadStepImage(step, slot) {
+  const cached = IMAGE_URLS[step.image];
+
+  if (cached) {
+    showStepImage(slot, cached, step, false);
+    return;
+  }
+
+  slot.innerHTML = `<p class="muted small tight">Loading screenshot&hellip;</p>`;
+  trySigningStepImage(step, slot, false);
+}
+
+function showStepImage(slot, url, step, isRetry) {
+  slot.innerHTML = `<figure class="step-image"><img src="${escapeHtml(url)}" alt="Screenshot for this step" /></figure>`;
+
+  slot.querySelector("img").addEventListener("error", () => {
+    if (isRetry) {
+      // Already tried signing it again once for this render; a second broken
+      // load in a row means the file itself is the problem, not the link.
+      slot.innerHTML = "";
+      return;
+    }
+    trySigningStepImage(step, slot, true);
+  }, { once: true });
+}
+
+async function trySigningStepImage(step, slot, isRetry) {
+  try {
+    const urls = await signImagePaths([step.image]);
+
+    if (urls[step.image]) {
+      // Kept for the rest of the library too, not just this one render — the
+      // next step with the same screenshot, or a later visit to this one,
+      // should not have to sign it again a moment later.
+      IMAGE_URLS[step.image] = urls[step.image];
+      showStepImage(slot, urls[step.image], step, isRetry);
+    } else {
+      // Signed without error, but the file itself is not there any more.
+      slot.innerHTML = "";
+    }
+  } catch (error) {
+    slot.innerHTML = `<div data-recovery></div>`;
+    renderSessionRecovery(slot.querySelector("[data-recovery]"), error,
+      () => trySigningStepImage(step, slot, isRetry));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Flagging a step
+// ---------------------------------------------------------------------------
+//
+// A quiet, always-available way to say "something is wrong with this step"
+// without breaking off a live call to explain it. One optional line, sent the
+// moment it is submitted — there is no confirmation to get past, and nothing
+// here waits on, or is waited on by, any of the step's other buttons.
+//
+// The write is durable the instant it succeeds, so unlike the rest of the
+// call's state this never needs to arm the call-in-progress guard: closing
+// the tab after flagging loses nothing, because there is nothing left to lose.
+
+// Icon-sized, so this reads as a utility next to "mark done" and "issue
+// resolved" rather than a third option of the same weight. U+2691, a plain
+// flag glyph rather than a coloured emoji, to stay in the same quiet,
+// monochrome register as the rest of the app's icon-free buttons.
+function flagControlMarkup() {
+  if (previewMode) return "";
+  return `
+    <div class="flag-control">
+      <button type="button" class="btn btn-quiet btn-icon" id="flow-flag-toggle"
+              title="Flag this step" aria-label="Flag this step" aria-expanded="false">&#9873;</button>
+    </div>
+  `;
+}
+
+function flagPopoverMarkup() {
+  if (previewMode) return "";
+  return `
+    <div class="flag-popover" id="flow-flag-popover" hidden>
+      <label class="field-label" for="flow-flag-reason">What's wrong, briefly? <span class="hint">optional</span></label>
+      <div class="flag-popover-row">
+        <input type="text" id="flow-flag-reason" maxlength="${MAX_FLAG_REASON_LENGTH}" autocomplete="off"
+               placeholder="A word or two is enough" />
+        <button type="button" class="btn btn-primary btn-small" id="flow-flag-send">Send</button>
+      </div>
+      <p class="muted small tight" id="flow-flag-note" hidden></p>
+    </div>
+  `;
+}
+
+// Wires up whichever flag control is currently in the DOM. Both step branches
+// in renderFlowStep insert exactly one of these, so there is only ever one to
+// wire — this does not need to know which kind of step it is attached to.
+function wireFlagControl(kba, step) {
+  if (previewMode) return;                 // there is no control in the DOM to wire
+
+  const toggle = document.getElementById("flow-flag-toggle");
+  const popover = document.getElementById("flow-flag-popover");
+  const input = document.getElementById("flow-flag-reason");
+  const send = document.getElementById("flow-flag-send");
+  const note = document.getElementById("flow-flag-note");
+
+  const openPopover = () => {
+    popover.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+    input.value = "";
+    // Reopening always starts clean, even if the last attempt from here
+    // ended mid-recovery — otherwise a closed, disabled input from a failed
+    // send would stay disabled and unfocusable the next time this opens.
+    input.disabled = false;
+    send.disabled = false;
+    note.hidden = true;
+    input.focus();
+  };
+
+  const closePopover = () => {
+    popover.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+  };
+
+  toggle.addEventListener("click", () => {
+    if (popover.hidden) openPopover();
+    else closePopover();
+  });
+
+  input.addEventListener("keydown", event => {
+    if (event.key === "Enter") { event.preventDefault(); send.click(); }
+    if (event.key === "Escape") { event.preventDefault(); closePopover(); toggle.focus(); }
+  });
+
+  // input.value is re-read fresh each time this runs, so a retry — whether
+  // from signing back in or from a plain "try again" — resubmits exactly
+  // what was typed the first time, without the analyst having to type it in
+  // again or the popover needing to remember it separately.
+  const trySendingFlag = async () => {
+    try {
+      await flagStep(kba.id, step.label || step.text, input.value);
+
+      closePopover();
+      // A quiet, momentary acknowledgement rather than anything that needs
+      // dismissing — the call carries straight on regardless of whether
+      // anyone notices it.
+      toggle.classList.add("flag-toggle-sent");
+      toggle.title = "Flagged";
+      toggle.setAttribute("aria-label", "Flagged");
+    } catch (error) {
+      renderSessionRecovery(note, error, trySendingFlag);
+    }
+  };
+
+  send.addEventListener("click", () => {
+    send.disabled = true;
+    input.disabled = true;
+    note.hidden = true;
+    trySendingFlag();
+  });
 }
 
 function renderFlowStep() {
@@ -305,37 +787,85 @@ function renderFlowStep() {
 
   const stepEl = document.getElementById("flow-step");
 
+  if (!step) {
+    stepEl.innerHTML = `
+      <div class="message message-problem">
+        <p class="message-text">This KBA is broken: step "${escapeHtml(state.currentStepId)}" does not exist.</p>
+        <p>Something earlier points at it with a "next" that does not match any real step id.
+        Check the KBA's steps${previewMode ? " and fix the pointer" : ""}.</p>
+      </div>
+    `;
+    return;
+  }
+
   if (step.type === "outcome") {
     goToReview(step);
     return;
   }
 
-  if (step.type === "action") {
-    // Already signed, so this is a straight lookup. Nothing here goes to the
-    // network before the step is on screen.
-    const imageUrl = step.image ? IMAGE_URLS[step.image] : "";
+  if (step.type === "action" || step.type === "record") {
+    // A record step asks for a value rather than a confirmation. Everything else
+    // about the two is the same, including the two ways out of the call.
+    const recording = step.type === "record";
 
     stepEl.innerHTML = `
       <p class="step-text">${escapeHtml(step.text)}</p>
-      ${imageUrl ? `<figure class="step-image"><img src="${escapeHtml(imageUrl)}" alt="Screenshot for this step" /></figure>` : ""}
+      ${step.image ? `<div class="step-image-slot" data-image-slot></div>` : ""}
+      ${recording ? `
+        <label class="field-label" for="flow-record">${escapeHtml(step.label || "What did you find?")}</label>
+        <input type="text" id="flow-record" autocomplete="off"
+               placeholder="${escapeHtml(step.placeholder || "")}" />
+        <p class="errors" id="flow-record-error" hidden></p>
+      ` : ""}
       <div class="option-row">
-        <button class="btn btn-primary" id="flow-next">Mark done and continue</button>
+        <button class="btn btn-primary" id="flow-next">${recording ? "Continue" : "Mark done and continue"}</button>
         <button class="btn btn-ghost" id="flow-resolved">Issue resolved</button>
+        <button class="btn btn-ghost" id="flow-blocked">Cannot perform this check</button>
+        ${flagControlMarkup()}
       </div>
+      ${flagPopoverMarkup()}
     `;
 
-    const image = stepEl.querySelector(".step-image img");
-    if (image) {
-      // A link that has expired or a file that has gone should not leave a
-      // broken icon sitting in the middle of a call.
-      image.addEventListener("error", () => { image.closest(".step-image").hidden = true; });
-    }
+    if (step.image) loadStepImage(step, stepEl.querySelector("[data-image-slot]"));
 
-    document.getElementById("flow-next").addEventListener("click", () => {
-      state.log.push({ label: step.label || step.text, answer: "Yes" });
+    // What a record step has been given so far, or "" for an action step.
+    const recordedValue = () => recording ? document.getElementById("flow-record").value.trim() : "";
+
+    const continueOn = () => {
+      const label = step.label || step.text;
+
+      if (recording) {
+        const value = recordedValue();
+        if (!value) {
+          const errorEl = document.getElementById("flow-record-error");
+          errorEl.textContent = "Note what you found before carrying on.";
+          errorEl.hidden = false;
+          document.getElementById("flow-record").focus();
+          return;
+        }
+        // Kept by label as well as logged, so an outcome asking for the same
+        // thing by name can be filled in without asking twice.
+        state.recorded[label] = value;
+        logStep({ label, answer: value });
+      } else {
+        logStep({ label, answer: "Yes" });
+      }
+
       state.currentStepId = step.next;
       renderFlowStep();
-    });
+    };
+
+    document.getElementById("flow-next").addEventListener("click", continueOn);
+
+    if (recording) {
+      const input = document.getElementById("flow-record");
+      input.focus();
+      input.addEventListener("keydown", event => {
+        if (event.key === "Enter") { event.preventDefault(); continueOn(); }
+      });
+      // Clear a complaint as soon as the analyst starts answering it.
+      input.addEventListener("input", () => { document.getElementById("flow-record-error").hidden = true; });
+    }
 
     document.getElementById("flow-resolved").addEventListener("click", () => {
       const label = step.label || step.text;
@@ -348,11 +878,23 @@ function renderFlowStep() {
 
       // This step was carried out — it is what resolved the issue. The ones
       // after it are simply never reached, so they never reach the log either.
-      state.log.push({ label, answer: "Yes" });
+      //
+      // On a record step the value is logged if there is one. It is not demanded:
+      // an issue that fixes itself mid-call leaves nothing to note, and the
+      // alternative is an analyst inventing a reading.
+      const value = recordedValue();
+      if (recording && value) state.recorded[label] = value;
+      logStep({ label, answer: recording ? (value || "Not recorded") : "Yes" });
       state.resolvedAfter = label;
 
       goToReview(findResolveOutcome(kba, step.next) || FALLBACK_RESOLVE);
     });
+
+    document.getElementById("flow-blocked").addEventListener("click", () => {
+      openBlockedModal(kba, step);
+    });
+
+    wireFlagControl(kba, step);
     return;
   }
 
@@ -360,13 +902,15 @@ function renderFlowStep() {
     <p class="step-text">${escapeHtml(step.text)}</p>
     <div class="option-row">
       ${step.options.map(o => `<button class="btn btn-ghost" data-next="${escapeHtml(o.next)}" data-label="${escapeHtml(o.label)}">${escapeHtml(o.label)}</button>`).join("")}
+      ${flagControlMarkup()}
     </div>
+    ${flagPopoverMarkup()}
   `;
 
   stepEl.querySelectorAll("[data-next]").forEach(btn => {
     btn.addEventListener("click", () => {
       if (!step.outcomeCheck) {
-        state.log.push({
+        logStep({
           label: step.label || step.text,
           answer: btn.dataset.label
         });
@@ -375,10 +919,103 @@ function renderFlowStep() {
       renderFlowStep();
     });
   });
+
+  wireFlagControl(kba, step);
 }
+
+// ---------------------------------------------------------------------------
+// A step that cannot be carried out
+// ---------------------------------------------------------------------------
+//
+// Sometimes the procedure cannot be finished: the user is not at the till, the
+// back office is down, nobody has the key to the cabinet. The call still has to
+// go somewhere, and second line still has to know why it arrived with half the
+// checks done.
+//
+// The reason is required, because an escalation that says only "could not do it"
+// is the thing second line bounces straight back.
+
+// Which step the modal is asking about, and what to put focus back on when it
+// closes. Null whenever the modal is shut.
+let blockedContext = null;
+
+function openBlockedModal(kba, step) {
+  blockedContext = { kba, step, returnFocus: document.activeElement };
+
+  document.getElementById("blocked-modal-step").textContent = step.label || step.text;
+  document.getElementById("blocked-reason").value = "";
+  document.getElementById("blocked-error").hidden = true;
+  document.getElementById("blocked-modal").hidden = false;
+  document.getElementById("blocked-reason").focus();
+}
+
+function closeBlockedModal() {
+  document.getElementById("blocked-modal").hidden = true;
+
+  const returnFocus = blockedContext && blockedContext.returnFocus;
+  blockedContext = null;
+
+  // Back to the button that opened it, so a keyboard user is not dropped at the
+  // top of the page.
+  if (returnFocus && returnFocus.isConnected) returnFocus.focus();
+}
+
+document.getElementById("blocked-cancel").addEventListener("click", closeBlockedModal);
+
+// The backdrop only — a click inside the dialog should not dismiss it.
+document.getElementById("blocked-modal").addEventListener("click", event => {
+  if (event.target.id === "blocked-modal") closeBlockedModal();
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && blockedContext) closeBlockedModal();
+});
+
+// Not being able to do a step does not always mean somebody else has to. The
+// user rings off, or says it started working, or the check turns out not to
+// apply to their setup — and the call is simply done. Both endings record the
+// same thing against the step; they differ only in where the call goes next.
+function endBlockedCall(outcome) {
+  if (!blockedContext) return;
+
+  const reason = document.getElementById("blocked-reason").value.trim();
+  const errorEl = document.getElementById("blocked-error");
+
+  if (!reason) {
+    errorEl.textContent = "Say why the step cannot be done. Whoever reads the ticket needs this, " +
+                          "whether it is second line or the next person to take the call.";
+    errorEl.hidden = false;
+    document.getElementById("blocked-reason").focus();
+    return;
+  }
+
+  const { kba, step } = blockedContext;
+  const label = step.label || step.text;
+
+  closeBlockedModal();
+
+  // Recorded against the step it happened on, in the same list as the checks
+  // that were carried out, so the ticket reads in order.
+  logStep({ label, answer: `Cannot perform (${reason})` });
+  state.blockedReason = reason;
+
+  // The KBA's own outcome, so its team and capture fields come with it. Its note
+  // is left alone rather than overwritten: outcome objects are shared with the
+  // loaded library, and writing to one would change the KBA itself.
+  goToReview(outcome === "resolve"
+    ? findResolveOutcome(kba, step.next) || FALLBACK_RESOLVE
+    : findEscalateOutcome(kba, step.next) || FALLBACK_ESCALATE);
+}
+
+document.getElementById("blocked-confirm").addEventListener("click", () => endBlockedCall("escalate"));
+document.getElementById("blocked-resolve").addEventListener("click", () => endBlockedCall("resolve"));
 
 function goToReview(outcomeStep) {
   showScreen("screen-review");
+
+  document.getElementById("copy-description").textContent =
+    previewMode ? "Back to KBA library" : "Copy description";
+
   const badge = document.getElementById("review-badge");
   const fieldsEl = document.getElementById("review-fields");
   fieldsEl.innerHTML = "";
@@ -395,19 +1032,37 @@ function goToReview(outcomeStep) {
   }
 
   (outcomeStep.captureFields || []).forEach(f => {
+    // A record step earlier in the call may already have asked for this by name.
+    // Matched loosely on purpose: the same thing gets typed into a KBA's steps
+    // and its capture fields by different people on different days.
+    const recorded = recordedValueFor(f);
+    if (recorded) state.captured[f] = recorded;
+
     const row = document.createElement("div");
     row.className = "field-row";
-    row.innerHTML = `<label>${escapeHtml(f)}</label><input type="text" data-field="${escapeHtml(f)}" placeholder="Enter ${escapeHtml(f.toLowerCase())}" />`;
+    row.innerHTML = `
+      <label>${escapeHtml(f)}</label>
+      <input type="text" data-field="${escapeHtml(f)}" value="${escapeHtml(state.captured[f] || "")}"
+             placeholder="Enter ${escapeHtml(f.toLowerCase())}" />
+      ${recorded ? `<p class="muted small tight prefilled">Noted during the call. Change it if it is wrong.</p>` : ""}
+    `;
     fieldsEl.appendChild(row);
   });
   fieldsEl.querySelectorAll("input").forEach(input => {
     input.addEventListener("input", () => {
-      state.captured[input.dataset.field] = input.value;
-      renderDescription(outcomeStep);
+      recordCapturedField(input.dataset.field, input.value, outcomeStep);
     });
   });
 
   renderDescription(outcomeStep);
+}
+
+// The value noted at a record step whose label is this capture field, if there
+// was one. Trimmed and case-insensitive, so "Till number" finds "till number".
+function recordedValueFor(field) {
+  const wanted = field.trim().toLowerCase();
+  const match = Object.keys(state.recorded).find(label => label.trim().toLowerCase() === wanted);
+  return match ? state.recorded[match] : "";
 }
 
 function lowerFirst(s) {
@@ -435,11 +1090,19 @@ function renderDescription(outcomeStep) {
   if (outcomeStep.note) parts.push("", outcomeStep.note);
 
   if (outcomeStep.outcome === "resolve") {
-    parts.push("", "Issue resolved", "Shared the reference number");
+    parts.push("", "Issue resolved");
+    // Closed without working through the whole KBA, so the ticket says which
+    // check stopped and why rather than reading as a clean run.
+    if (state.blockedReason) parts.push(`Reason: Resolved without completing all checks — ${state.blockedReason}`);
+    parts.push("Shared the reference number");
   } else if (outcomeStep.outcome === "callback") {
     parts.push("", "Shared the reference number");
   } else {
-    parts.push("", "Assigning to the second line team", "Shared the reference number");
+    parts.push("", "Assigning to the second line team");
+    // Second line needs to know the procedure was not finished, and why, before
+    // they read a list of checks that stops short.
+    if (state.blockedReason) parts.push(`Reason: Unable to complete troubleshooting — ${state.blockedReason}`);
+    parts.push("Shared the reference number");
   }
 
   document.getElementById("review-description").value = parts.join("\n");
@@ -448,6 +1111,232 @@ function renderDescription(outcomeStep) {
 // ---------------------------------------------------------------------------
 // Manage KBAs screen
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The manage screen's flag backlog
+// ---------------------------------------------------------------------------
+//
+// Fetched only when something could plausibly have changed it — opening the
+// manage screen, deleting or resetting the library, marking one resolved —
+// never on every re-render, so filtering the KBA list or saving an edit does
+// not fire a network call that has nothing to do with either.
+
+let openFlags = [];
+// null until the Resolved tab has actually been opened once during this visit
+// to the manage screen — that is the thing that decides whether opening it
+// fetches, or just re-renders what is already in hand.
+let resolvedFlags = null;
+let flagsTab = "open";
+
+function formatFlagTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function updateFlagsBadge() {
+  const badge = document.getElementById("flags-badge");
+  badge.textContent = openFlags.length;
+  badge.hidden = openFlags.length === 0;
+}
+
+function setFlagsTab(tab) {
+  flagsTab = tab;
+  document.getElementById("flags-tab-open").setAttribute("aria-selected", String(tab === "open"));
+  document.getElementById("flags-tab-resolved").setAttribute("aria-selected", String(tab === "resolved"));
+}
+
+async function renderFlagsPanel() {
+  const section = document.getElementById("flags-section");
+  if (!isAdmin()) { section.hidden = true; return; }
+
+  section.hidden = false;
+
+  // Whatever brought the admin back to this screen — opening it fresh,
+  // deleting or resetting the library, recovering from a failed load — could
+  // have changed what is resolved, so any cached Resolved-tab data is no
+  // longer trustworthy and the view falls back to Open until asked again.
+  resolvedFlags = null;
+  setFlagsTab("open");
+
+  try {
+    openFlags = await loadOpenFlags();
+  } catch (error) {
+    console.error(error);
+    openFlags = [];
+    document.getElementById("flags-tab-content").innerHTML =
+      `<p class="muted small tight">Flags could not be loaded. ${escapeHtml(error.message || error)}</p>`;
+    updateFlagsBadge();
+    return;
+  }
+
+  updateFlagsBadge();
+  renderFlagsTabContent();
+}
+
+// Renders whichever tab is currently selected. Fetches the resolved list only
+// the first time it is asked for — the one requirement this feature adds
+// beyond the open list that already existed — and reuses it after that for
+// as long as it stays valid.
+async function renderFlagsTabContent() {
+  const content = document.getElementById("flags-tab-content");
+
+  if (flagsTab === "open") {
+    renderFlagsGroup(content, openFlags, "open");
+    return;
+  }
+
+  if (resolvedFlags === null) {
+    content.innerHTML = `<p class="muted small tight">Loading&hellip;</p>`;
+    try {
+      resolvedFlags = await loadResolvedFlags();
+    } catch (error) {
+      console.error(error);
+      resolvedFlags = [];
+      content.innerHTML =
+        `<p class="muted small tight">Resolved flags could not be loaded. ${escapeHtml(error.message || error)}</p>`;
+      return;
+    }
+  }
+
+  renderFlagsGroup(content, resolvedFlags, "resolved");
+}
+
+// The half of a flag row that is the same regardless of tab. What differs is
+// which action it offers: an optional note plus Mark resolved on an open
+// flag, or Reopen plus who cleared it and when on a resolved one.
+function flagRowMarkup(flag, kind) {
+  const actions = kind === "open"
+    ? `
+      <div class="flag-row-actions">
+        <input type="text" data-resolve-note="${escapeHtml(flag.id)}" maxlength="${MAX_FLAG_REASON_LENGTH}"
+               autocomplete="off" placeholder="Optional note" />
+        <button class="btn btn-quiet btn-small" data-resolve-flag="${escapeHtml(flag.id)}">Mark resolved</button>
+      </div>
+    `
+    : `
+      <div class="flag-row-actions">
+        <button class="btn btn-quiet btn-small" data-reopen-flag="${escapeHtml(flag.id)}">Reopen</button>
+      </div>
+    `;
+
+  return `
+    <div class="flag-row">
+      <div class="flag-row-body">
+        <p class="flag-row-step">${escapeHtml(flag.step_label || "General")}</p>
+        ${flag.reason ? `<p class="flag-row-reason">${escapeHtml(flag.reason)}</p>` : ""}
+        <p class="flag-row-meta">${escapeHtml(flag.flagged_by)} &middot; ${escapeHtml(formatFlagTime(flag.created_at))}</p>
+        ${kind === "resolved" ? `
+          <p class="flag-row-meta">Resolved by ${escapeHtml(flag.resolved_by || "")} &middot; ${escapeHtml(formatFlagTime(flag.resolved_at))}</p>
+          ${flag.resolution_note ? `<p class="flag-row-reason">${escapeHtml(flag.resolution_note)}</p>` : ""}
+        ` : ""}
+        <p class="errors" data-flag-error="${escapeHtml(flag.id)}" hidden></p>
+      </div>
+      ${actions}
+    </div>
+  `;
+}
+
+// Grouped by KBA, in the order the KBAs already appear in the library, rather
+// than say alphabetically by reference — which would put a KBA an admin
+// barely recognises ahead of one they use every day. A reference the library
+// no longer has (should not happen; the database cascades a flag away with
+// its KBA) still falls back to itself rather than being silently dropped.
+function renderFlagsGroup(container, flags, kind) {
+  if (!flags.length) {
+    container.innerHTML = kind === "open"
+      ? `<p class="muted small tight">No open flags.</p>`
+      : `<p class="muted small tight">No resolved flags yet.</p>`;
+    return;
+  }
+
+  const byKba = new Map();
+  flags.forEach(flag => {
+    if (!byKba.has(flag.kba_id)) byKba.set(flag.kba_id, []);
+    byKba.get(flag.kba_id).push(flag);
+  });
+
+  const order = [...new Set([...KBAS.map(k => k.id), ...byKba.keys()])];
+
+  container.innerHTML = order
+    .filter(ref => byKba.has(ref))
+    .map(ref => {
+      const kba = KBAS.find(k => k.id === ref);
+      const title = kba ? kba.title : ref;
+      const rows = byKba.get(ref);
+
+      return `
+        <div class="flags-group">
+          <p class="flags-group-title">${escapeHtml(title)} <span class="muted small">${rows.length} ${kind}</span></p>
+          ${rows.map(flag => flagRowMarkup(flag, kind)).join("")}
+        </div>
+      `;
+    }).join("");
+
+  container.querySelectorAll("[data-resolve-flag]").forEach(wireResolveButton);
+  container.querySelectorAll("[data-reopen-flag]").forEach(wireReopenButton);
+}
+
+function wireResolveButton(btn) {
+  btn.addEventListener("click", async () => {
+    const id = btn.dataset.resolveFlag;
+    const row = btn.closest(".flag-row");
+    const noteInput = row.querySelector(`[data-resolve-note="${id}"]`);
+    const errorEl = row.querySelector(`[data-flag-error="${id}"]`);
+
+    btn.disabled = true;
+    if (noteInput) noteInput.disabled = true;
+
+    try {
+      const patch = await resolveFlag(id, noteInput ? noteInput.value : "");
+      const original = openFlags.find(flag => flag.id === id);
+
+      openFlags = openFlags.filter(flag => flag.id !== id);
+      // Only kept in step if the Resolved tab has actually been loaded once
+      // already — if it has not, the next time it is opened it fetches fresh
+      // and this row will be in it regardless.
+      if (resolvedFlags !== null && original) resolvedFlags = [{ ...original, ...patch }, ...resolvedFlags];
+
+      updateFlagsBadge();
+      renderFlagsTabContent();
+    } catch (error) {
+      console.error(error);
+      btn.disabled = false;
+      if (noteInput) noteInput.disabled = false;
+      errorEl.textContent = error.message || String(error);
+      errorEl.hidden = false;
+    }
+  });
+}
+
+function wireReopenButton(btn) {
+  btn.addEventListener("click", async () => {
+    const id = btn.dataset.reopenFlag;
+    const row = btn.closest(".flag-row");
+    const errorEl = row.querySelector(`[data-flag-error="${id}"]`);
+
+    btn.disabled = true;
+
+    try {
+      const patch = await reopenFlag(id);
+      const original = resolvedFlags ? resolvedFlags.find(flag => flag.id === id) : null;
+
+      if (resolvedFlags !== null) resolvedFlags = resolvedFlags.filter(flag => flag.id !== id);
+      if (original) {
+        openFlags = [...openFlags, { ...original, ...patch }]
+          .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      }
+
+      updateFlagsBadge();
+      renderFlagsTabContent();
+    } catch (error) {
+      console.error(error);
+      btn.disabled = false;
+      errorEl.textContent = error.message || String(error);
+      errorEl.hidden = false;
+    }
+  });
+}
 
 function renderManageScreen() {
   const listEl = document.getElementById("kba-list");
@@ -466,6 +1355,7 @@ function renderManageScreen() {
   document.getElementById("reset-kbas").hidden = !canEdit;
   document.getElementById("manage-readonly").hidden = canEdit;
   document.querySelector(".filter-row").hidden = empty;
+  document.getElementById("flags-section").hidden = !canEdit;
 
   // The filter survives a re-render, so deleting or saving while filtered leaves
   // the analyst looking at the same slice of the library they were before.
@@ -526,6 +1416,7 @@ function renderManageScreen() {
           <p class="match-sub">${escapeHtml(kba.id)} · ${stepCount} steps</p>
         </div>
         <div class="row-actions">
+          ${canEdit ? `<button class="btn btn-ghost btn-small" data-preview="${escapeHtml(kba.id)}">Preview</button>` : ""}
           ${!canEdit ? "" : editable
             ? `<button class="btn btn-ghost btn-small" data-edit="${escapeHtml(kba.id)}">Edit</button>`
             : `<span class="badge badge-muted">Branching</span>`}
@@ -542,6 +1433,13 @@ function renderManageScreen() {
     listEl.appendChild(card);
   });
 
+  listEl.querySelectorAll("[data-preview]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const kba = KBAS.find(k => k.id === btn.dataset.preview);
+      if (kba) enterPreview(kba);
+    });
+  });
+
   listEl.querySelectorAll("[data-edit]").forEach(btn => {
     btn.addEventListener("click", () => openEditor(btn.dataset.edit));
   });
@@ -555,6 +1453,7 @@ function renderManageScreen() {
 
       await tidyKBAFolder(btn.dataset.delete);
       renderManageScreen();
+      renderFlagsPanel();
     });
   });
 }
@@ -611,7 +1510,27 @@ document.getElementById("clear-filter").addEventListener("click", () => {
   document.getElementById("kba-filter").focus();
 });
 
+document.getElementById("flags-toggle").addEventListener("click", () => {
+  const panel = document.getElementById("flags-panel");
+  const toggle = document.getElementById("flags-toggle");
+  const opening = panel.hidden;
+  panel.hidden = !opening;
+  toggle.setAttribute("aria-expanded", String(opening));
+});
+
+document.getElementById("flags-tab-open").addEventListener("click", () => {
+  setFlagsTab("open");
+  renderFlagsTabContent();
+});
+
+document.getElementById("flags-tab-resolved").addEventListener("click", () => {
+  setFlagsTab("resolved");
+  renderFlagsTabContent();
+});
+
 document.getElementById("nav-team").addEventListener("click", () => {
+  disarmCallGuard();
+  exitPreview();
   showScreen("screen-team");
   renderTeamScreen();
 });
@@ -619,11 +1538,16 @@ document.getElementById("nav-team").addEventListener("click", () => {
 document.getElementById("new-kba").addEventListener("click", () => openEditor(null));
 
 document.getElementById("nav-manage").addEventListener("click", () => {
+  disarmCallGuard();
+  exitPreview();
   showScreen("screen-manage");
   renderManageScreen();
+  renderFlagsPanel();
 });
 
 document.getElementById("nav-call").addEventListener("click", () => {
+  disarmCallGuard();
+  exitPreview();
   showScreen("screen-intake");
 });
 
@@ -636,6 +1560,7 @@ document.getElementById("reset-kbas").addEventListener("click", async () => {
 
   await tidyImages(images);
   renderManageScreen();
+  renderFlagsPanel();
 });
 
 document.getElementById("kba-search").addEventListener("input", renderSearchResults);
@@ -647,18 +1572,32 @@ document.getElementById("find-kba").addEventListener("click", () => {
 });
 
 document.getElementById("copy-description").addEventListener("click", () => {
+  if (previewMode) {
+    exitPreview();
+    showScreen("screen-manage");
+    renderManageScreen();
+    return;
+  }
+
   const ta = document.getElementById("review-description");
   ta.select();
   document.execCommand("copy");
+  // The ticket text is out of the browser now, so refreshing no longer loses
+  // anything that has not already been saved elsewhere.
+  disarmCallGuard();
 });
 
 document.getElementById("start-over").addEventListener("click", () => {
+  disarmCallGuard();
+  exitPreview();
   state.issueText = "";
   state.matches = [];
   state.selectedKBA = null;
   state.log = [];
   state.captured = {};
   state.resolvedAfter = "";
+  state.blockedReason = "";
+  state.recorded = {};
   document.getElementById("issue-text").value = "";
   document.getElementById("match-results").innerHTML = "";
   setPrimary("find-kba", true);
@@ -684,7 +1623,8 @@ let editorModel = null;
 // imagePath is what the flow JSON stores. imageFile and imagePreview only exist
 // between picking a file and saving, when the upload actually happens.
 function blankAction() {
-  return { text: "", label: "", imagePath: "", imageFile: null, imagePreview: "", uncertainNote: "" };
+  return { type: "action", text: "", label: "", placeholder: "",
+           imagePath: "", imageFile: null, imagePreview: "", uncertainNote: "" };
 }
 
 function blankFormModel() {
@@ -716,13 +1656,15 @@ function toFormModel(kba) {
   const visited = new Set();
 
   let stepId = kba.start;
-  while (kba.steps[stepId] && kba.steps[stepId].type === "action") {
+  while (kba.steps[stepId] && (kba.steps[stepId].type === "action" || kba.steps[stepId].type === "record")) {
     if (visited.has(stepId)) return null;
     visited.add(stepId);
     const step = kba.steps[stepId];
     actions.push({
+      type: step.type,
       text: step.text,
       label: step.label || "",
+      placeholder: step.placeholder || "",
       imagePath: step.image || "",
       imageFile: null,
       imagePreview: "",
@@ -781,9 +1723,10 @@ function fromFormModel(model) {
 
   model.actions.forEach((action, index) => {
     steps[`s${index + 1}`] = {
-      type: "action",
+      type: action.type === "record" ? "record" : "action",
       text: action.text,
       ...(action.label ? { label: action.label } : {}),
+      ...(action.type === "record" && action.placeholder ? { placeholder: action.placeholder } : {}),
       ...(action.imagePath ? { image: action.imagePath } : {}),
       next: index === model.actions.length - 1 ? "final" : `s${index + 2}`
     };
@@ -919,10 +1862,27 @@ function renderActionSteps() {
           <button class="btn btn-quiet btn-small" data-remove="${index}" ${actions.length === 1 ? "disabled" : ""}>Remove</button>
         </div>
       </div>
-      <label class="field-label">What the analyst does</label>
-      <textarea rows="2" data-action-text placeholder="e.g. Check and note the light status on the base unit of the till.">${escapeHtml(action.text)}</textarea>
-      <label class="field-label">Short label for the ticket <span class="hint">optional — the step text is used if this is blank</span></label>
-      <input type="text" data-action-label value="${escapeHtml(action.label)}" placeholder="e.g. Checked base unit light status" />
+      <label class="field-label">Step type</label>
+      <select data-action-type="${index}">
+        <option value="action"${action.type === "record" ? "" : " selected"}>Action — the analyst does something and confirms it</option>
+        <option value="record"${action.type === "record" ? " selected" : ""}>Record — the analyst notes a value</option>
+      </select>
+
+      <label class="field-label">${action.type === "record" ? "What the analyst checks" : "What the analyst does"}</label>
+      <textarea rows="2" data-action-text placeholder="${action.type === "record"
+        ? "e.g. Check the light status on the base unit of the till."
+        : "e.g. Power off the till by pressing and holding the button on the base unit."}">${escapeHtml(action.text)}</textarea>
+
+      <label class="field-label">${action.type === "record"
+        ? `Name of the value <span class="hint">used in the ticket, and fills a capture field of the same name</span>`
+        : `Short label for the ticket <span class="hint">optional — the step text is used if this is blank</span>`}</label>
+      <input type="text" data-action-label value="${escapeHtml(action.label)}" placeholder="${action.type === "record"
+        ? "e.g. Base unit light status" : "e.g. Powered off the till from the base unit"}" />
+
+      ${action.type === "record" ? `
+        <label class="field-label">Example value <span class="hint">optional — shown greyed out in the box the analyst types into</span></label>
+        <input type="text" data-action-placeholder value="${escapeHtml(action.placeholder)}" placeholder="e.g. Green, red, off" />
+      ` : ""}
 
       ${action.uncertainNote ? uncertainNoteMarkup(action.uncertainNote) : ""}
 
@@ -932,6 +1892,15 @@ function renderActionSteps() {
       <p class="errors step-image-error" data-image-error="${index}" hidden></p>
     </div>
   `).join("");
+
+  container.querySelectorAll("[data-action-type]").forEach(select => {
+    select.addEventListener("change", () => {
+      readEditorInputs();
+      // The row is redrawn because the two types ask for different things.
+      editorModel.actions[Number(select.dataset.actionType)].type = select.value;
+      renderActionSteps();
+    });
+  });
 
   container.querySelectorAll("[data-action-image]").forEach(input => {
     input.addEventListener("change", event => pickStepImage(Number(input.dataset.actionImage), event));
@@ -1044,9 +2013,15 @@ function readEditorInputs() {
   // only in the model, so it is carried across by position rather than re-read.
   model.actions = Array.from(document.querySelectorAll("#action-steps .step-row")).map((row, index) => {
     const existing = model.actions[index] || blankAction();
+    const placeholderInput = row.querySelector("[data-action-placeholder]");
+
     return {
+      type: row.querySelector("[data-action-type]").value === "record" ? "record" : "action",
       text: row.querySelector("[data-action-text]").value.trim(),
       label: row.querySelector("[data-action-label]").value.trim(),
+      // Only record steps have the field; an action step keeps whatever it had
+      // so switching type by mistake does not lose it.
+      placeholder: placeholderInput ? placeholderInput.value.trim() : existing.placeholder,
       imagePath: existing.imagePath,
       imageFile: existing.imageFile,
       imagePreview: existing.imagePreview,
@@ -1084,7 +2059,15 @@ function validateModel(model) {
   if (!model.actions.length) errors.push("Add at least one step.");
 
   model.actions.forEach((action, index) => {
-    if (!action.text) errors.push(`Step ${index + 1} needs a description of what the analyst does.`);
+    if (!action.text) {
+      errors.push(`Step ${index + 1} needs a description of what the analyst does.`);
+    }
+    // A record step's label is the name of the thing being written down: it is
+    // what the ticket shows and what a capture field is matched against, so it
+    // cannot fall back to the step text the way an action step's can.
+    if (action.type === "record" && !action.label) {
+      errors.push(`Step ${index + 1} records a value, so it needs a name for that value.`);
+    }
   });
 
   if (!model.question.text) errors.push("Add the final question that decides resolve or escalate.");
@@ -1103,8 +2086,8 @@ function validateFlow(kba) {
   // Where a step can lead. Outcomes lead nowhere, which is the point of them.
   const exitsOf = step => {
     if (step.type === "question") return (step.options || []).map(option => option.next);
-    if (step.type === "action") return [step.next];
-    return [];
+    if (step.type === "action" || step.type === "record") return [step.next];
+    return [];                                  // an outcome, which ends there
   };
 
   if (!steps[kba.start]) {
@@ -1594,6 +2577,9 @@ document.getElementById("save-kba").addEventListener("click", async () => {
   closeSourcePanel();
   showScreen("screen-manage");
   renderManageScreen();
+
+  const savedKba = KBAS.find(k => k.id === kba.id) || kba;
+  showActionNotice("manage-message", `Saved "${savedKba.title}".`, "Preview it", () => enterPreview(savedKba));
 });
 
 // ---------------------------------------------------------------------------
@@ -1727,7 +2713,10 @@ async function loadLibrary() {
 
   // A retry lands on whichever screen the analyst was already looking at.
   renderSearchResults();
-  if (document.getElementById("screen-manage").classList.contains("active")) renderManageScreen();
+  if (document.getElementById("screen-manage").classList.contains("active")) {
+    renderManageScreen();
+    renderFlagsPanel();
+  }
 
   return true;
 }
@@ -1806,6 +2795,8 @@ document.getElementById("auth-form").addEventListener("submit", async event => {
 });
 
 document.getElementById("sign-out").addEventListener("click", async () => {
+  disarmCallGuard();
+  exitPreview();
   await supabaseClient.auth.signOut();
 
   // Leave nothing from the previous session on screen.

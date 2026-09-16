@@ -94,12 +94,12 @@ function kbaToRow(kba) {
 const NOT_ALLOWED =
   "Your account cannot change the KBA library. Ask an admin in your organisation to make the change.";
 
-function throwIfBlocked(error) {
+function throwIfBlocked(error, message = NOT_ALLOWED) {
   if (!error) return;
   // Storage reports a refused write as a 403 rather than a Postgres error code.
   if (error.code === "42501" || String(error.statusCode) === "403" ||
       /row-level security|violates row-level/i.test(error.message || "")) {
-    throw new Error(NOT_ALLOWED);
+    throw new Error(message);
   }
   throw error;
 }
@@ -165,8 +165,12 @@ function imagePathsIn(kbas) {
   return paths;
 }
 
-async function signImageUrls(kbas) {
-  const paths = [...new Set(imagePathsIn(kbas))];
+// The actual signing round trip, over whatever paths are handed in. Split out
+// from signImageUrls so a single step's screenshot can be re-signed on its
+// own mid-call — when a session has only just expired, or a cached signed
+// URL has simply outlived its 8 hours — without re-signing the whole library
+// to do it.
+async function signImagePaths(paths) {
   if (!paths.length) return {};
 
   const { data, error } = await supabaseClient.storage
@@ -181,6 +185,10 @@ async function signImageUrls(kbas) {
     if (entry.signedUrl && !entry.error) urls[entry.path] = entry.signedUrl;
   });
   return urls;
+}
+
+async function signImageUrls(kbas) {
+  return signImagePaths([...new Set(imagePathsIn(kbas))]);
 }
 
 // Why a file cannot be accepted, or null if it can. Checked in the browser before
@@ -351,4 +359,132 @@ async function resetKBAs() {
   if (!data) throw new Error(NOT_ALLOWED);
 
   return saveKBAs(DEFAULT_KBAS);
+}
+
+// ---------------------------------------------------------------------------
+// Flags
+// ---------------------------------------------------------------------------
+//
+// The first thing this app keeps that outlives a single KBA rather than
+// living inside one. Deliberately thin — see supabase-setup.sql for the
+// schema, and for why kba_id below holds the app's reference string rather
+// than the kbas table's own uuid.
+//
+// org_id and flagged_by are both filled in server-side by column defaults —
+// see supabase-setup.sql — but sent explicitly here anyway, the same way
+// saveKBA sends org_id rather than leaning on its default. A real Postgres
+// default only exists in the real database; sending the value keeps this
+// file's own idea of "what got written" correct even against a stand-in that
+// has no defaults of its own to apply.
+
+const FLAGS_NOT_ALLOWED = "Only an admin can manage flags for this organisation.";
+// Shared by the flag's own reason and the optional note left when resolving
+// one — both are a pointer at a problem, or at what changed, not a place to
+// write a paragraph.
+const MAX_FLAG_REASON_LENGTH = 140;
+
+// Fired mid-call, so this asks for as little as it needs to: which
+// organisation and who, both already known without a lookup beyond the one
+// currentOrgId already makes, and nothing else. Errors are left for the
+// caller to word for a flagging popover rather than the KBA-library wording
+// throwIfBlocked defaults to — flagging is not restricted to admins in the
+// first place, so that wording would not even be true here.
+async function flagStep(kbaReference, stepLabel, reason) {
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  if (!session) throw new Error("Not signed in.");
+
+  const orgId = await currentOrgId();
+  const trimmedReason = (reason || "").trim().slice(0, MAX_FLAG_REASON_LENGTH);
+
+  const { error } = await supabaseClient
+    .from("kba_flags")
+    .insert({
+      org_id: orgId,
+      kba_id: kbaReference,
+      step_label: stepLabel || null,
+      reason: trimmedReason || null,
+      flagged_by: session.user.email
+    });
+
+  if (error) throw error;
+}
+
+// Every unresolved flag for the organisation, oldest first — so a backlog
+// reads in the order things went wrong. Admins only: an analyst's client gets
+// none back, since the row level security policy excludes them rather than
+// raising an error, and this file mirrors that by simply returning whatever
+// comes back rather than checking the role itself.
+async function loadOpenFlags() {
+  const { data, error } = await supabaseClient
+    .from("kba_flags")
+    .select("id, kba_id, step_label, reason, flagged_by, created_at")
+    .eq("resolved", false)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+  return data;
+}
+
+// Fetched only when the manage screen's Resolved tab is actually opened —
+// never bundled in with loadOpenFlags, since most visits to this screen have
+// no reason to look at what has already been dealt with. Newest first: a
+// recently-cleared flag is more likely to be what an admin is checking on
+// than one settled months ago.
+async function loadResolvedFlags() {
+  const { data, error } = await supabaseClient
+    .from("kba_flags")
+    .select("id, kba_id, step_label, reason, flagged_by, created_at, resolved_by, resolved_at, resolution_note")
+    .eq("resolved", true)
+    .order("resolved_at", { ascending: false });
+
+  if (error) throw error;
+  return data;
+}
+
+// Returns exactly the fields this just wrote, so the caller can merge them
+// into whatever copy of the row it already has (loadOpenFlags already handed
+// one over when the flag was first raised) rather than asking the database
+// to hand the whole row back a second time. resolved_at in particular has no
+// column default to fall back on the way created_at does for an insert — an
+// update never runs one — so it is generated here, once, and this is the
+// only copy of it that ever needs to exist.
+async function resolveFlag(id, note) {
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  if (!session) throw new Error("Not signed in.");
+
+  const patch = {
+    resolved: true,
+    resolved_by: session.user.email,
+    resolved_at: new Date().toISOString(),
+    resolution_note: (note || "").trim().slice(0, MAX_FLAG_REASON_LENGTH) || null
+  };
+
+  const { data, error } = await supabaseClient
+    .from("kba_flags")
+    .update(patch)
+    .eq("id", id)
+    .select("id");
+
+  throwIfBlocked(error, FLAGS_NOT_ALLOWED);
+  // A row an update policy hides matches nothing rather than erroring, the
+  // same trap saveKBA and its neighbours already guard against.
+  if (!data || !data.length) throw new Error(FLAGS_NOT_ALLOWED);
+  return patch;
+}
+
+// The reverse of resolveFlag. Clears the resolution fields back to null rather
+// than leaving them behind — they describe the current resolution, and once
+// reopened there is not one, not a history of the last one there was.
+async function reopenFlag(id) {
+  const patch = { resolved: false, resolved_by: null, resolved_at: null, resolution_note: null };
+
+  const { data, error } = await supabaseClient
+    .from("kba_flags")
+    .update(patch)
+    .eq("id", id)
+    .select("id");
+
+  throwIfBlocked(error, FLAGS_NOT_ALLOWED);
+  if (!data || !data.length) throw new Error(FLAGS_NOT_ALLOWED);
+  return patch;
 }

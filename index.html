@@ -76,6 +76,10 @@
 
 <main class="app-shell" id="app-shell" hidden>
 
+  <div class="preview-banner" id="preview-banner" hidden>
+    <strong>Previewing</strong> &mdash; nothing here is a real call.
+  </div>
+
   <section id="screen-intake" class="screen active">
     <h1>What's the issue?</h1>
     <p class="lede">Describe the call in your own words. The assistant matches it against the KBA library.</p>
@@ -114,6 +118,24 @@
       <h1>KBA library</h1>
       <span id="kba-count" class="muted"></span>
     </div>
+
+    <div class="flags-section" id="flags-section" hidden>
+      <button type="button" class="flags-toggle" id="flags-toggle" aria-expanded="false" aria-controls="flags-panel">
+        <span>Flagged steps</span>
+        <span class="badge badge-danger" id="flags-badge" hidden></span>
+        <span class="flags-chevron" aria-hidden="true">&#9656;</span>
+      </button>
+      <div class="flags-panel" id="flags-panel" hidden>
+        <div class="flags-tabs" role="tablist">
+          <button type="button" class="flags-tab" id="flags-tab-open" data-flags-tab="open"
+                  role="tab" aria-selected="true">Open</button>
+          <button type="button" class="flags-tab" id="flags-tab-resolved" data-flags-tab="resolved"
+                  role="tab" aria-selected="false">Resolved</button>
+        </div>
+        <div id="flags-tab-content"></div>
+      </div>
+    </div>
+
     <div id="manage-message" hidden></div>
 
     <p class="notice" id="manage-readonly" hidden>
@@ -232,6 +254,31 @@
   </section>
 
 </main>
+
+<div class="modal-backdrop" id="blocked-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="blocked-modal-title">
+    <h2 id="blocked-modal-title">Cannot perform this check</h2>
+    <p class="muted small tight">
+      This step: <span id="blocked-modal-step"></span>
+    </p>
+
+    <label class="field-label" for="blocked-reason">Why can it not be done?</label>
+    <textarea id="blocked-reason" rows="3"
+              placeholder="e.g. The user is off-site and cannot reach the till"></textarea>
+    <p class="muted small tight">
+      The call ends here either way, and the reason is recorded against this step.
+      Escalate if second line needs to pick it up; resolve it if no further work is needed.
+    </p>
+
+    <p class="errors" id="blocked-error" hidden></p>
+
+    <div class="modal-actions">
+      <button class="btn btn-quiet" id="blocked-cancel" type="button">Cancel</button>
+      <button class="btn btn-ghost" id="blocked-resolve" type="button">Resolve the call</button>
+      <button class="btn btn-primary" id="blocked-confirm" type="button">Escalate to second line</button>
+    </div>
+  </div>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>

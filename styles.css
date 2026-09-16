@@ -866,3 +866,272 @@ body.is-busy #busy-bar::after {
 
 #draft-uncertain { margin: 0 0 var(--space-5); }
 #draft-uncertain ul { margin: var(--space-2) 0 0; padding-left: var(--space-4); }
+
+/* --- Modal ---------------------------------------------------------------
+   Used when a step cannot be carried out and the call has to end there. */
+
+.modal-backdrop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  padding: var(--space-5);
+  background: rgba(27, 36, 48, 0.42);
+}
+
+.modal {
+  width: 100%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-6);
+  box-shadow: 0 12px 40px rgba(27, 36, 48, 0.18);
+}
+
+.modal h2 { font-size: var(--text-xl); margin: 0 0 var(--space-2); letter-spacing: -0.01em; }
+.modal .field-label { margin-top: var(--space-4); }
+.modal textarea { margin-bottom: var(--space-3); }
+.modal .errors { margin: var(--space-3) 0 0; }
+
+#blocked-modal-step { color: var(--ink); font-weight: 600; }
+
+.modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+}
+
+/* Both endings name what they do, and a label that breaks across two lines
+   reads as two options rather than one. */
+.modal-actions .btn { margin-top: 0; white-space: nowrap; }
+
+/* Cancel sits away from the two that end the call, so it is not picked by
+   accident when reaching for the nearest button. */
+#blocked-cancel { margin-right: auto; }
+
+@media (max-width: 700px) {
+  .modal-backdrop { padding: var(--space-3); align-items: flex-end; }
+  .modal { padding: var(--space-5) var(--space-4); max-height: 92vh; }
+  .modal-actions { flex-direction: column-reverse; align-items: stretch; }
+  .modal-actions .btn { width: 100%; }
+}
+
+/* --- Record steps --------------------------------------------------------- */
+
+/* The value a record step asks for, on the call screen. */
+#flow-record { margin-bottom: var(--space-4); }
+#flow-record-error { margin: calc(var(--space-4) * -1 + var(--space-2)) 0 var(--space-4); }
+
+/* A capture field already answered earlier in the call. */
+.field-row .prefilled { margin: var(--space-2) 0 0; }
+
+/* Step type, in the KBA form. */
+select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 11px 14px;
+  font-size: var(--text-base);
+  font-family: inherit;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+
+.step-row select { margin-bottom: var(--space-4); }
+
+/* --- Flagging a step ------------------------------------------------------
+   Icon-sized on purpose: this sits alongside "mark done" and "issue
+   resolved" without reading as a third thing of equal weight to choose
+   between. */
+
+.flag-control { margin-left: auto; }
+.flag-control .btn { margin-top: 0; }
+
+.flag-toggle-sent { color: var(--success-ink); }
+
+.flag-popover {
+  flex: 1 1 100%;
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-sunken);
+}
+
+.flag-popover-row { display: flex; align-items: center; gap: var(--space-2); }
+.flag-popover-row input { margin-bottom: 0; flex: 1 1 auto; min-width: 0; }
+.flag-popover-row .btn { margin-top: 0; flex: none; }
+
+.flag-popover .errors,
+.flag-popover .muted.small.tight { margin: var(--space-2) 0 0; }
+
+/* --- The manage screen's flag backlog ------------------------------------- */
+
+.flags-section { margin-bottom: var(--space-5); }
+
+.flags-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+  margin-top: 0;
+}
+
+.flags-toggle:hover { background: var(--surface-sunken); }
+
+.flags-chevron {
+  margin-left: auto;
+  color: var(--ink-muted);
+  font-size: var(--text-xs);
+  transition: transform 0.12s ease;
+}
+
+.flags-toggle[aria-expanded="true"] .flags-chevron { transform: rotate(90deg); }
+
+.flags-panel {
+  margin-top: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: var(--space-4);
+}
+
+.flags-group { margin-bottom: var(--space-4); }
+.flags-group:last-child { margin-bottom: 0; }
+
+.flags-group-title {
+  font-weight: 600;
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-2);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.flag-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.flag-row + .flag-row { border-top: 1px solid var(--border); }
+
+.flag-row-body { min-width: 0; }
+.flag-row-step { font-weight: 600; font-size: var(--text-sm); margin: 0; }
+.flag-row-reason { margin: var(--space-1) 0 0; color: var(--ink-muted); font-size: var(--text-sm); }
+.flag-row-meta { margin: var(--space-1) 0 0; color: var(--ink-muted); font-size: var(--text-xs); }
+
+.flag-row .btn { margin-top: 0; flex: none; }
+.flag-row .errors { flex: 1 1 100%; margin: var(--space-2) 0 0; }
+
+@media (max-width: 700px) {
+  /* The rest of .option-row goes full width and stacks; the flag control
+     stays put so it does not suddenly read as a fourth big button. */
+  .flag-control { align-self: flex-end; width: auto; }
+  .flag-control .btn { width: auto; }
+
+  .flag-row { flex-direction: column; align-items: stretch; }
+  .flag-row .btn { width: auto; align-self: flex-start; }
+}
+
+/* --- Open / Resolved tabs in the flags panel ------------------------------ */
+
+.flags-tabs {
+  display: flex;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-3);
+}
+
+.flags-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: var(--space-2) 0;
+  margin-top: 0;
+  margin-bottom: -1px;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--ink-muted);
+  cursor: pointer;
+}
+
+.flags-tab:hover { color: var(--ink); }
+.flags-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+
+/* The optional note beside "Mark resolved", and the button itself once a row
+   is showing the Reopen action instead. */
+.flag-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.flag-row-actions input { margin-bottom: 0; width: 180px; }
+.flag-row-actions .btn { margin-top: 0; }
+
+@media (max-width: 700px) {
+  .flag-row-actions { width: 100%; flex-wrap: wrap; }
+  .flag-row-actions input { flex: 1 1 auto; width: auto; }
+}
+
+/* --- Previewing a KBA ------------------------------------------------------
+   Reuses the call flow exactly as a real call runs it, so the only thing
+   this needs of its own is a way to say, unmistakably, that it is not one. */
+
+.preview-banner {
+  background: var(--warning-bg);
+  color: var(--warning-ink);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-5);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.preview-banner strong { font-weight: 700; }
+
+/* --- Recovering from a session or connection problem mid-call ------------- */
+
+/* The small sign-in prompt reused inside the flag popover or a step's image
+   slot. Its own scoped spacing, the same way the main sign-in screen tunes
+   its inputs, since the base input styling carries none of its own. */
+[data-reauth-form] input {
+  margin-bottom: var(--space-3);
+}
+
+[data-reauth-form] .btn { margin-top: var(--space-1); }
+
+[data-recovery-message] { margin-bottom: 0; }
+
+.step-image-slot:empty { display: none; }

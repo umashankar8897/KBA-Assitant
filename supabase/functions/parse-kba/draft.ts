@@ -258,7 +258,9 @@ export function validateFlow(kba: any): string[] {
 
   const exitsOf = (step: any): string[] => {
     if (step.type === "question") return (step.options || []).map((option: any) => option.next);
-    if (step.type === "action") return [step.next];
+    // A drafted KBA only contains action steps today, but a record step leads on
+    // in exactly the same way and must not be mistaken for an ending.
+    if (step.type === "action" || step.type === "record") return [step.next];
     return [];
   };
 

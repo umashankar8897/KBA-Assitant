@@ -2,6 +2,7 @@
 //
 // Step types:
 //   action   — analyst performs it and marks it done; recorded under "Checks performed"
+//   record   — analyst notes a value; the value itself is what gets recorded
 //   question — a branching decision; the KBA's outcomeCheck decides resolve vs escalate
 //   outcome  — resolve / callback / escalate, optionally with fields to capture
 //
@@ -20,9 +21,13 @@ const DEFAULT_KBAS = [
     start: "s1",
     steps: {
       s1: {
-        type: "action",
-        text: "Check and note the light status on the base unit of the till.",
-        label: "Checked base unit light status",
+        // A value to write down rather than something to confirm. Its label
+        // matches the capture field of the same name on the escalate outcome,
+        // so what the analyst notes here fills that in for them.
+        type: "record",
+        text: "Check the light status on the base unit of the till.",
+        label: "Base unit light status",
+        placeholder: "e.g. green, red, flashing, off",
         next: "s2"
       },
       s2: {

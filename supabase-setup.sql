@@ -193,3 +193,95 @@ create policy "admins delete org images" on storage.objects
     and (storage.foldername(name))[1] = public.current_org_id()::text
     and public.current_role_name() = 'admin'
   );
+
+-- ---------------------------------------------------------------------------
+-- kba_flags
+-- ---------------------------------------------------------------------------
+--
+-- The first thing this app keeps that outlives a single KBA rather than
+-- living inside one. An analyst mid-call who spots something wrong with a
+-- step raises a flag without breaking off the call to explain it properly;
+-- an admin works through the backlog afterwards.
+--
+-- Deliberately thin: which step, an optional short reason, who raised it,
+-- and whether it has been dealt with. Nothing here is meant to hold what
+-- actually happened on the call — that already lives in the ticket the
+-- analyst raises through the normal review screen.
+--
+-- kba_id holds the same reference string the rest of the app calls a KBA's
+-- id (e.g. "kba-till-power"), not the kbas table's own uuid primary key. The
+-- call screen only ever has that reference in hand, and looking the uuid up
+-- first would mean a network round trip before something meant to fire
+-- immediately.
+
+-- Mirrors current_org_id() / current_role_name() above: a security definer
+-- function is the only safe way for a policy (or, here, a column default) to
+-- read something the anon key cannot query directly. auth.users is not
+-- exposed to PostgREST at all.
+create or replace function public.current_user_email()
+returns text language sql stable security definer set search_path = public as $$
+  select email from auth.users where id = auth.uid();
+$$;
+
+create table if not exists public.kba_flags (
+  id          uuid primary key default gen_random_uuid(),
+  org_id      uuid not null default public.current_org_id() references public.organisations on delete cascade,
+  kba_id      text not null,
+  step_label  text,
+  -- Short on purpose: this is a pointer at a problem, not a place to describe
+  -- one. Enforced here as well as in the form, since a check constraint is
+  -- the one thing a client cannot work around.
+  reason      text check (reason is null or char_length(reason) <= 140),
+  flagged_by  text not null default public.current_user_email(),
+  created_at  timestamptz not null default now(),
+  resolved    boolean not null default false,
+  -- Who cleared it and when, and an optional short note about what changed —
+  -- the same 140-character cap as reason, for the same reason. All three are
+  -- null while a flag is open, and cleared back to null on reopening: they
+  -- describe the current resolution, not a history of every past one.
+  resolved_by      text,
+  resolved_at      timestamptz,
+  resolution_note  text check (resolution_note is null or char_length(resolution_note) <= 140),
+
+  -- Ties a flag to a real KBA in the same organisation, and — since kbas has
+  -- no update path for reference, only insert and delete — takes the flag
+  -- with it if that KBA is ever deleted, rather than leaving a flag pointing
+  -- at nothing.
+  foreign key (org_id, kba_id) references public.kbas (org_id, reference) on delete cascade
+);
+
+-- Safe against a database that already has kba_flags from before these
+-- columns existed: create table if not exists above will have done nothing
+-- on such a database, so these pick up the difference.
+alter table public.kba_flags add column if not exists resolved_by text;
+alter table public.kba_flags add column if not exists resolved_at timestamptz;
+alter table public.kba_flags add column if not exists resolution_note text;
+alter table public.kba_flags drop constraint if exists kba_flags_resolution_note_check;
+alter table public.kba_flags add constraint kba_flags_resolution_note_check
+  check (resolution_note is null or char_length(resolution_note) <= 140);
+
+create index if not exists kba_flags_org_id_idx on public.kba_flags (org_id);
+-- The only query the manage screen ever makes: an organisation's open flags.
+create index if not exists kba_flags_unresolved_idx on public.kba_flags (org_id) where not resolved;
+
+alter table public.kba_flags enable row level security;
+
+-- Raising a flag is not limited to analysts in the database, even though it is
+-- analysts this feature is for: an admin works calls too, and should be able
+-- to flag a step just as fast. What is restricted is reading the backlog back
+-- and clearing it — that stays with admins, same as the rest of KBA
+-- management. Nobody can update org_id or kba_id after the fact, and nothing
+-- can delete a row at all: resolving only ever sets a flag aside, never
+-- removes it.
+drop policy if exists "members insert org flags" on public.kba_flags;
+create policy "members insert org flags" on public.kba_flags
+  for insert with check (org_id = public.current_org_id());
+
+drop policy if exists "admins read org flags" on public.kba_flags;
+create policy "admins read org flags" on public.kba_flags
+  for select using (org_id = public.current_org_id() and public.current_role_name() = 'admin');
+
+drop policy if exists "admins update org flags" on public.kba_flags;
+create policy "admins update org flags" on public.kba_flags
+  for update using (org_id = public.current_org_id() and public.current_role_name() = 'admin')
+          with check (org_id = public.current_org_id() and public.current_role_name() = 'admin');
