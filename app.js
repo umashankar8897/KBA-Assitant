@@ -505,11 +505,20 @@ function exitPreview() {
 function classifySessionError(error) {
   if (typeof navigator !== "undefined" && navigator.onLine === false) return "network";
 
-  const status = error && (error.status || error.statusCode || (error.context && error.context.status));
-  const text = String((error && error.message) || error || "").toLowerCase();
+  // Storage errors carry their HTTP status as a string ("403", not 403) —
+  // the same reason throwIfBlocked in storage.js coerces before comparing.
+  // Missing this meant a real expired-session error from loading a
+  // screenshot never matched here, and fell through to the generic message
+  // instead of the sign-in prompt.
+  const status = String(
+    (error && (error.status || error.statusCode || (error.context && error.context.status))) || ""
+  );
+  // error.code carries PostgREST's own short codes (PGRST301 for an expired
+  // JWT); error.message is not always where that shows up.
+  const text = String((error && (error.message || error.code)) || error || "").toLowerCase();
 
-  if (status === 401 || status === 403 ||
-      /jwt|pgrst301|not authenticated|refresh_token|invalid refresh token|session.*expired|expired.*session/.test(text)) {
+  if (status === "401" || status === "403" ||
+      /jwt|pgrst301|unauthorized|forbidden|not authenticated|not signed in|no session|refresh_token|invalid refresh token|session.*expired|expired.*session/.test(text)) {
     return "auth";
   }
 
@@ -521,16 +530,24 @@ function classifySessionError(error) {
 }
 
 // Classifies the error and renders whichever recovery belongs in container:
-// a small sign-in prompt for an expired session, or a message with a plain
-// retry button for a dropped connection or anything else. retry is called
-// with no arguments and is expected to run the whole attempt over again —
-// including this same recovery step, if it fails again the same way.
-function renderSessionRecovery(container, error, retry) {
+// the shared sign-in overlay for an expired session, or a message with a
+// plain retry button for a dropped connection or anything else. retry is
+// called with no arguments and is expected to run the whole attempt over
+// again — including this same recovery step, if it fails again the same way.
+// onCancel is optional and only used by the auth case: it runs if the
+// analyst backs out of the sign-in overlay without signing in, for a caller
+// that needs to undo something — like re-enabling a disabled Send button —
+// left over from the attempt that failed in the first place.
+function renderSessionRecovery(container, error, retry, onCancel) {
   console.error(error);
   const kind = classifySessionError(error);
 
   if (kind === "auth") {
-    renderInlineReauth(container, retry);
+    // The overlay is shared and page-level, not written into container — the
+    // point of it is to sit on top of the step, not replace whatever was
+    // already showing in the popover or image slot underneath.
+    container.hidden = true;
+    openReauthModal(retry, onCancel);
     return;
   }
 
@@ -547,64 +564,108 @@ function renderSessionRecovery(container, error, retry) {
   container.hidden = false;
 }
 
-// A small sign-in prompt for exactly one situation: the analyst's own session
-// has expired mid-call. Reuses the same field markup and classes as the main
-// sign-in form, but not the form itself — nobody creating an account or
-// joining an organisation belongs here, only signing back into the one
-// already in use, so the smaller, purpose-built handler below is enough.
-let reauthSeq = 0;
+// ---------------------------------------------------------------------------
+// Signing back in mid-call
+// ---------------------------------------------------------------------------
+//
+// One shared overlay for exactly one situation: the analyst's own session has
+// expired while flagging a step or loading a screenshot. Reuses the same
+// email and password fields as the main sign-in form on #screen-auth — not
+// that form itself, since nobody creating an account or joining an
+// organisation belongs here, only signing back into the one already in use —
+// laid over the step with the same modal the "cannot perform this check"
+// prompt already uses, so the step underneath is never replaced, only
+// covered until this closes.
 
-function renderInlineReauth(container, onRetry) {
-  const seq = ++reauthSeq;
+// { retry, onCancel, returnFocus } while the modal is open, otherwise null.
+// retry is called with no arguments on a successful sign-in — it is whatever
+// failed the first time, run again. onCancel is different: it only runs if
+// the analyst backs out without signing in, and exists for exactly one
+// reason — the flag popover's Send button and reason box are disabled from
+// the moment Send was first clicked, and this overlay is now independent of
+// that popover's own open/close lifecycle, so nothing else would re-enable
+// them if this closes without a retry ever running.
+let reauthContext = null;
 
-  container.hidden = false;
-  container.innerHTML = `
-    <p class="errors small tight">Your session has expired. Sign in again to continue.</p>
-    <form data-reauth-form>
-      <label class="field-label" for="reauth-email-${seq}">Email</label>
-      <input type="email" id="reauth-email-${seq}" autocomplete="email" required />
-      <label class="field-label" for="reauth-password-${seq}">Password</label>
-      <input type="password" id="reauth-password-${seq}" autocomplete="current-password" required />
-      <button type="submit" class="btn btn-primary btn-small">Sign in</button>
-      <p class="errors small tight" data-reauth-error hidden></p>
-    </form>
-  `;
+function openReauthModal(retry, onCancel) {
+  reauthContext = { retry, onCancel, returnFocus: document.activeElement };
 
-  const form = container.querySelector("[data-reauth-form]");
-
-  form.addEventListener("submit", async event => {
-    event.preventDefault();
-
-    const email = form.querySelector(`#reauth-email-${seq}`).value.trim();
-    const password = form.querySelector(`#reauth-password-${seq}`).value;
-    const button = form.querySelector("button");
-    const errorEl = form.querySelector("[data-reauth-error]");
-
-    button.disabled = true;
-    button.textContent = "Signing in\u2026";
-    errorEl.hidden = true;
-
-    // Deliberately the plain call, not the main auth form's submit handler —
-    // that one also carries sign-up, join codes and organisation names, none
-    // of which apply to signing back into an account already in use. Signing
-    // in as the same user this quietly resumes into is a no-op for the rest
-    // of the app: applySession already skips re-loading anything when the
-    // signed-in user id has not changed, which is exactly what leaves the
-    // current step undisturbed.
-    const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
-
-    if (error) {
-      button.disabled = false;
-      button.textContent = "Sign in";
-      errorEl.textContent = error.message;
-      errorEl.hidden = false;
-      return;
-    }
-
-    // Signed back in. Retry the one thing that actually failed, and nothing else.
-    onRetry();
-  });
+  document.getElementById("reauth-email").value = "";
+  document.getElementById("reauth-password").value = "";
+  document.getElementById("reauth-error").hidden = true;
+  document.getElementById("reauth-modal").hidden = false;
+  document.getElementById("reauth-email").focus();
 }
+
+// Used by the successful sign-in path only — deliberately does not run
+// onCancel, since signing in is the opposite of backing out.
+function closeReauthModal() {
+  document.getElementById("reauth-modal").hidden = true;
+
+  const returnFocus = reauthContext && reauthContext.returnFocus;
+  reauthContext = null;
+
+  // Back to whatever had focus before this opened — the flag's Send button,
+  // or nothing in particular for an image — rather than dropping a keyboard
+  // user at the top of the page.
+  if (returnFocus && returnFocus.isConnected) returnFocus.focus();
+}
+
+// Cancel, the backdrop and Escape all back out without signing in.
+function cancelReauthModal() {
+  const onCancel = reauthContext && reauthContext.onCancel;
+  closeReauthModal();
+  if (onCancel) onCancel();
+}
+
+document.getElementById("reauth-cancel").addEventListener("click", cancelReauthModal);
+
+// The backdrop only — a click inside the dialog should not dismiss it.
+document.getElementById("reauth-modal").addEventListener("click", event => {
+  if (event.target.id === "reauth-modal") cancelReauthModal();
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && reauthContext) cancelReauthModal();
+});
+
+document.getElementById("reauth-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!reauthContext) return;
+
+  const email = document.getElementById("reauth-email").value.trim();
+  const password = document.getElementById("reauth-password").value;
+  const button = document.getElementById("reauth-submit");
+  const errorEl = document.getElementById("reauth-error");
+
+  button.disabled = true;
+  button.textContent = "Signing in\u2026";
+  errorEl.hidden = true;
+
+  // Deliberately the plain call, not the main auth form's submit handler —
+  // that one also carries sign-up, join codes and organisation names, none
+  // of which apply to signing back into an account already in use. Signing
+  // in as the same user this quietly resumes into is a no-op for the rest
+  // of the app: applySession already skips re-loading anything when the
+  // signed-in user id has not changed, which is exactly what leaves the
+  // current step undisturbed.
+  const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+
+  button.disabled = false;
+  button.textContent = "Sign in";
+
+  if (error) {
+    errorEl.textContent = error.message;
+    errorEl.hidden = false;
+    return;
+  }
+
+  // Signed back in. Close the overlay, then retry the one thing that
+  // actually failed — and nothing else — leaving the step exactly as it was.
+  const retry = reauthContext.retry;
+  closeReauthModal();
+  retry();
+});
 
 // ---------------------------------------------------------------------------
 // A step's screenshot
@@ -762,7 +823,13 @@ function wireFlagControl(kba, step) {
       toggle.title = "Flagged";
       toggle.setAttribute("aria-label", "Flagged");
     } catch (error) {
-      renderSessionRecovery(note, error, trySendingFlag);
+      renderSessionRecovery(note, error, trySendingFlag, () => {
+        // Only reached if the sign-in overlay is cancelled rather than
+        // completed — a successful sign-in retries the flag instead, which
+        // leaves the popover in whatever state that attempt ends in.
+        send.disabled = false;
+        input.disabled = false;
+      });
     }
   };
 
@@ -774,6 +841,46 @@ function wireFlagControl(kba, step) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// An optional note on a step
+// ---------------------------------------------------------------------------
+//
+// Separate from flagging and from "cannot perform this check" — both of
+// those exist because something is wrong enough to need attention or to end
+// the call. This is for a step that went fine but not cleanly: completed,
+// but worth a line explaining how. Always visible, since it's one field, but
+// its placeholder and label make clear it's optional. Only ever attached at
+// the moment the step is actually completed — "Issue resolved" and "cannot
+// perform" are their own endings with their own wording, and do not pick
+// this up.
+
+function stepCommentMarkup() {
+  return `
+    <div class="step-comment">
+      <label class="field-label" for="step-comment-input">
+        Note <span class="hint">optional — shown under this check in the description</span>
+      </label>
+      <input type="text" id="step-comment-input" autocomplete="off"
+             placeholder="Optional note — e.g. took three attempts, base unit was warm to touch" />
+    </div>
+  `;
+}
+
+// Whatever is currently typed in the step's note field, trimmed — "" if the
+// step doesn't render one at all, same as if it was left empty.
+function currentStepComment() {
+  const input = document.getElementById("step-comment-input");
+  return input ? input.value.trim() : "";
+}
+
+// Folds a comment into a log entry only if there is one, so an entry with
+// nothing typed comes out exactly as it always has — {label, answer}, no
+// comment key at all — rather than carrying an empty or undefined one.
+function withComment(entry, comment) {
+  const trimmed = (comment || "").trim();
+  return trimmed ? { ...entry, comment: trimmed } : entry;
+}
+
 function renderFlowStep() {
   const kba = state.selectedKBA;
   const step = kba.steps[state.currentStepId];
@@ -782,7 +889,7 @@ function renderFlowStep() {
 
   const logEl = document.getElementById("flow-log");
   logEl.innerHTML = state.log
-    .map((e, i) => `<div class="log-item"><i class="ti ti-check"></i><span>${i + 1} - ${escapeHtml(e.label)} - ${escapeHtml(e.answer)}</span></div>`)
+    .map((e, i) => `<div class="log-item"><i class="ti ti-check"></i><span>${i + 1} - ${escapeHtml(e.label)}${e.answer !== undefined ? ` - ${escapeHtml(e.answer)}` : ""}</span></div>`)
     .join("");
 
   const stepEl = document.getElementById("flow-step");
@@ -817,6 +924,7 @@ function renderFlowStep() {
                placeholder="${escapeHtml(step.placeholder || "")}" />
         <p class="errors" id="flow-record-error" hidden></p>
       ` : ""}
+      ${stepCommentMarkup()}
       <div class="option-row">
         <button class="btn btn-primary" id="flow-next">${recording ? "Continue" : "Mark done and continue"}</button>
         <button class="btn btn-ghost" id="flow-resolved">Issue resolved</button>
@@ -846,9 +954,12 @@ function renderFlowStep() {
         // Kept by label as well as logged, so an outcome asking for the same
         // thing by name can be filled in without asking twice.
         state.recorded[label] = value;
-        logStep({ label, answer: value });
+        logStep(withComment({ label, answer: value }, currentStepComment()));
       } else {
-        logStep({ label, answer: "Yes" });
+        // A plain action step has no real answer to report — completing it
+        // was the only possible outcome — so no answer key at all, rather
+        // than a meaningless "Yes" standing in for one.
+        logStep(withComment({ label }, currentStepComment()));
       }
 
       state.currentStepId = step.next;
@@ -900,6 +1011,7 @@ function renderFlowStep() {
 
   stepEl.innerHTML = `
     <p class="step-text">${escapeHtml(step.text)}</p>
+    ${stepCommentMarkup()}
     <div class="option-row">
       ${step.options.map(o => `<button class="btn btn-ghost" data-next="${escapeHtml(o.next)}" data-label="${escapeHtml(o.label)}">${escapeHtml(o.label)}</button>`).join("")}
       ${flagControlMarkup()}
@@ -910,10 +1022,10 @@ function renderFlowStep() {
   stepEl.querySelectorAll("[data-next]").forEach(btn => {
     btn.addEventListener("click", () => {
       if (!step.outcomeCheck) {
-        logStep({
+        logStep(withComment({
           label: step.label || step.text,
           answer: btn.dataset.label
-        });
+        }, currentStepComment()));
       }
       state.currentStepId = btn.dataset.next;
       renderFlowStep();
@@ -1076,7 +1188,10 @@ function renderDescription(outcomeStep) {
   const parts = [issueLine];
 
   const checks = state.log
-    .map((e, i) => `${i + 1} - ${e.label} - ${e.answer}`)
+    .map((e, i) => {
+      const line = e.answer !== undefined ? `${i + 1} - ${e.label} - ${e.answer}` : `${i + 1} - ${e.label}`;
+      return e.comment ? `${line}\n    Note: ${e.comment}` : line;
+    })
     .join("\n");
   if (checks) parts.push("", "Checks performed", checks);
 

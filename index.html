@@ -280,6 +280,33 @@
   </div>
 </div>
 
+<!-- Shared by flagging a step and loading a step's screenshot: the one thing
+     mid-call that can fail because the analyst's session has expired. Reuses
+     the same email/password fields as the main sign-in form on #screen-auth
+     — this is deliberately not a second login UI, just that same form's
+     fields, shown as an overlay so the step underneath is never replaced. -->
+<div class="modal-backdrop" id="reauth-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reauth-modal-title">
+    <h2 id="reauth-modal-title">Sign in again</h2>
+    <p class="muted small tight">Your session has expired. Sign in to pick up right where you left off.</p>
+
+    <form id="reauth-form">
+      <label class="field-label" for="reauth-email">Email</label>
+      <input type="email" id="reauth-email" autocomplete="email" placeholder="you@example.com" />
+
+      <label class="field-label" for="reauth-password">Password</label>
+      <input type="password" id="reauth-password" autocomplete="current-password" placeholder="At least 6 characters" />
+
+      <p class="errors" id="reauth-error" hidden></p>
+
+      <div class="modal-actions">
+        <button class="btn btn-quiet" id="reauth-cancel" type="button">Cancel</button>
+        <button class="btn btn-primary" id="reauth-submit" type="submit">Sign in</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="config.js"></script>

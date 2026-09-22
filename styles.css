@@ -896,6 +896,7 @@ body.is-busy #busy-bar::after {
 .modal h2 { font-size: var(--text-xl); margin: 0 0 var(--space-2); letter-spacing: -0.01em; }
 .modal .field-label { margin-top: var(--space-4); }
 .modal textarea { margin-bottom: var(--space-3); }
+.modal input { margin-bottom: 0; }
 .modal .errors { margin: var(--space-3) 0 0; }
 
 #blocked-modal-step { color: var(--ink); font-weight: 600; }
@@ -932,6 +933,10 @@ body.is-busy #busy-bar::after {
 
 /* A capture field already answered earlier in the call. */
 .field-row .prefilled { margin: var(--space-2) 0 0; }
+
+/* Optional per-step note, always visible on action/record/question steps. */
+.step-comment { margin: 0 0 var(--space-4); }
+.step-comment input { margin-bottom: 0; }
 
 /* Step type, in the KBA form. */
 select {
